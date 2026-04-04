@@ -1,0 +1,26 @@
+[Unit]
+Description=Claude Code API Wrapper
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/claude-code-api
+ExecStart=/usr/bin/node /opt/claude-code-api/server.js
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-code-api
+
+# Configurable via environment overrides or a drop-in file:
+#   /etc/systemd/system/claude-code-api.service.d/override.conf
+Environment=PORT=3456
+Environment=TIMEOUT=120000
+# NODE_ENV=production
+
+# Optional: run as a specific user
+# User=myuser
+
+[Install]
+WantedBy=multi-user.target
