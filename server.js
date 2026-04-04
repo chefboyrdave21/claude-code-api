@@ -117,6 +117,7 @@ function runClaude(model, prompt, system) {
   return new Promise((resolve, reject) => {
     const args = [
       '--print',
+      '--dangerously-skip-permissions',
       '--model', model,
       '--output-format', 'json',
       '--no-session-persistence',
