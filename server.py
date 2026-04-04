@@ -23,11 +23,15 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from typing import AsyncIterator
 
+import anthropic as anthropic_sdk
 from aiohttp import web
+
+CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -93,11 +97,82 @@ def normalise_model(model: str) -> str:
     return DEFAULT_MODEL
 
 
+def _has_images(messages: list) -> bool:
+    """Return True if any message contains an image_url content block."""
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    return True
+    return False
+
+
+def _openai_content_to_anthropic(content) -> list:
+    """
+    Convert an OpenAI content value to Anthropic content block list.
+    Handles: plain string, text blocks, image_url blocks (data URI or https URL).
+    """
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+
+    blocks = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type", "")
+        if btype == "text":
+            blocks.append({"type": "text", "text": block.get("text", "")})
+        elif btype == "image_url":
+            url = block.get("image_url", {}).get("url", "")
+            if url.startswith("data:"):
+                # data:image/jpeg;base64,/9j/...
+                try:
+                    header, data = url.split(",", 1)
+                    media_type = header.split(";")[0].split(":")[1]
+                    blocks.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data},
+                    })
+                except Exception as exc:
+                    log.warning("Skipping malformed image data URI: %s", exc)
+            else:
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "url", "url": url},
+                })
+    return blocks
+
+
+def messages_to_anthropic(messages: list) -> tuple[str, list]:
+    """
+    Convert OpenAI messages → (system_str, anthropic_messages_list).
+    Used by the SDK path (vision requests).
+    """
+    system_parts: list[str] = []
+    anthropic_msgs: list[dict] = []
+
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            text = content if isinstance(content, str) else " ".join(
+                c.get("text", "") for c in content if isinstance(c, dict)
+            )
+            system_parts.append(text)
+        else:
+            anthropic_msgs.append({
+                "role": role,
+                "content": _openai_content_to_anthropic(content),
+            })
+
+    return "\n".join(system_parts), anthropic_msgs
+
+
 def messages_to_prompt(messages: list) -> tuple[str, str]:
     """
-    Convert OpenAI-style messages list to (system_prompt, user_prompt).
-    Single-user message → (system, content).
-    Multi-turn → formatted conversation ending with 'Assistant:'.
+    Convert OpenAI-style messages list to (system_prompt, user_prompt) for claude CLI.
+    Text-only path — image blocks are silently dropped here (use SDK path for vision).
     """
     system_parts: list[str] = []
     turns: list[tuple[str, str]] = []
@@ -106,12 +181,11 @@ def messages_to_prompt(messages: list) -> tuple[str, str]:
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if isinstance(content, list):
-            # Multi-modal content: extract text blocks
+            # Text-only extraction; images handled by SDK path
             content = "\n".join(
                 c.get("text", "") for c in content
                 if isinstance(c, dict) and c.get("type") == "text"
             )
-
         if role == "system":
             system_parts.append(content)
         else:
@@ -122,7 +196,6 @@ def messages_to_prompt(messages: list) -> tuple[str, str]:
     if len(turns) == 1 and turns[0][0] == "user":
         return system, turns[0][1]
 
-    # Multi-turn: format as conversation
     lines = []
     for role, content in turns:
         prefix = "Human" if role == "user" else "Assistant"
@@ -231,6 +304,49 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
     return text, usage
 
 
+def _get_oauth_token() -> str:
+    """Read the current OAuth access token from Claude Code credentials."""
+    with open(CREDS_PATH) as f:
+        creds = json.load(f)
+    return creds["claudeAiOauth"]["accessToken"]
+
+
+async def _run_claude_sdk(model: str, system: str, anthropic_msgs: list) -> tuple[str, dict]:
+    """
+    Call the Anthropic API directly via SDK for vision / multi-modal requests.
+    Uses the OAuth access token from ~/.claude/.credentials.json (subscription-covered,
+    same token Claude Code uses — re-read on every call so expiry is handled).
+    Does NOT consume the CLI semaphore — SDK calls are async and concurrent-safe.
+    """
+    token = _get_oauth_token()
+    client = anthropic_sdk.AsyncAnthropic(api_key=token)
+
+    kwargs: dict = {
+        "model": model,
+        "max_tokens": 4096,
+        "messages": anthropic_msgs,
+    }
+    if system:
+        kwargs["system"] = system
+
+    log.debug("SDK call: model=%s msgs=%d (vision path)", model, len(anthropic_msgs))
+
+    try:
+        response = await asyncio.wait_for(
+            client.messages.create(**kwargs),
+            timeout=REQUEST_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"Anthropic SDK call timed out after {REQUEST_TIMEOUT}s")
+
+    text = "".join(b.text for b in response.content if hasattr(b, "text"))
+    usage = {
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+    }
+    return text, usage
+
+
 async def _fake_stream_chunks(text: str, chunk_size: int = 80) -> AsyncIterator[str]:
     """
     Break a completed response into chunks for SSE emission.
@@ -286,10 +402,16 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     if not messages:
         raise web.HTTPBadRequest(text="messages array is required")
 
-    system, prompt = messages_to_prompt(messages)
+    vision = _has_images(messages)
 
-    log.info("→ %s | stream=%s | model=%s | %d chars",
-             request.remote, streaming, model, len(prompt))
+    if vision:
+        system, anthropic_msgs = messages_to_anthropic(messages)
+        log.info("→ %s | stream=%s | model=%s | vision=True | %d msgs",
+                 request.remote, streaming, model, len(anthropic_msgs))
+    else:
+        system, prompt = messages_to_prompt(messages)
+        log.info("→ %s | stream=%s | model=%s | %d chars",
+                 request.remote, streaming, model, len(prompt))
 
     if streaming:
         response = web.StreamResponse(
@@ -302,10 +424,11 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         await response.prepare(request)
 
         try:
-            # Run claude with json output (avoids stream-json opus timeout)
-            text, usage = await _run_claude_json(model, prompt, system)
+            if vision:
+                text, usage = await _run_claude_sdk(model, system, anthropic_msgs)
+            else:
+                text, usage = await _run_claude_json(model, prompt, system)
 
-            # Opening role delta (OpenAI convention)
             role_chunk = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
                 "object": "chat.completion.chunk",
@@ -315,12 +438,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             }
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
 
-            # Emit result in chunks
             async for delta in _fake_stream_chunks(text):
                 if delta:
                     await response.write(make_sse_chunk(model, delta).encode())
 
-            # Final finish chunk
             await response.write(make_sse_chunk(model, "", finish=True).encode())
             await response.write(b"data: [DONE]\n\n")
 
@@ -334,7 +455,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
     else:
         try:
-            text, usage = await _run_claude_json(model, prompt, system)
+            if vision:
+                text, usage = await _run_claude_sdk(model, system, anthropic_msgs)
+            else:
+                text, usage = await _run_claude_json(model, prompt, system)
         except Exception as exc:
             log.error("Non-stream error: %s", exc)
             return web.json_response(
@@ -342,7 +466,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                 status=500,
             )
 
-        log.info("← %s | model=%s | %d output chars", request.remote, model, len(text))
+        log.info("← %s | model=%s | %d output chars | vision=%s",
+                 request.remote, model, len(text), vision)
         resp = make_completion_response(
             model=model,
             content=text,
