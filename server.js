@@ -122,10 +122,12 @@ function runClaude(model, prompt, system) {
       '--output-format', 'json',
       '--no-session-persistence',
     ];
-    if (system) args.push('--append-system-prompt', system);
-    args.push(prompt);
+    // Pipe via stdin — avoids [Errno 7] Argument list too long on large contexts.
+    // System prompt is prepended inline; passing it as --append-system-prompt would
+    // also be a CLI arg and hit the same ARG_MAX limit.
+    const stdinText = system ? `[System: ${system}]\n\n${prompt}` : prompt;
 
-    const child = spawn('claude', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
     let stdout = '';
     let stderr = '';
@@ -136,6 +138,9 @@ function runClaude(model, prompt, system) {
       child.kill('SIGTERM');
       setTimeout(() => child.kill('SIGKILL'), 3000);
     }, TIMEOUT_MS);
+
+    child.stdin.write(stdinText);
+    child.stdin.end();
 
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
     child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });

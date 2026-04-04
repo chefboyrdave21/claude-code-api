@@ -179,6 +179,10 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
     Run `claude --print --output-format json` and return (text_result, usage_dict).
     Acquires the global semaphore to serialise calls.
     """
+    # Pipe prompt via stdin — avoids [Errno 7] Argument list too long on large contexts.
+    # System prompt is prepended inline; --append-system-prompt would also be a CLI arg.
+    stdin_text = f"[System: {system}]\n\n{prompt}" if system else prompt
+
     cmd = [
         "claude", "--print",
         "--dangerously-skip-permissions",
@@ -186,11 +190,8 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
         "--output-format", "json",
         "--no-session-persistence",
     ]
-    if system:
-        cmd += ["--append-system-prompt", system]
-    cmd.append(prompt)
 
-    log.debug("Running (non-stream): %s", " ".join(cmd[:6]) + " ...")
+    log.debug("Running (non-stream): %s | stdin=%d chars", " ".join(cmd[:6]) + " ...", len(stdin_text))
 
     async with asyncio.timeout(QUEUE_TIMEOUT):
         await sem().acquire()
@@ -198,12 +199,13 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=REQUEST_TIMEOUT
+                proc.communicate(input=stdin_text.encode()), timeout=REQUEST_TIMEOUT
             )
         except asyncio.TimeoutError:
             proc.kill()
