@@ -447,10 +447,16 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
         except Exception as exc:
             log.error("Streaming error: %s", exc)
-            err_chunk = json.dumps({"error": {"message": str(exc), "type": "server_error"}})
-            await response.write(f"data: {err_chunk}\n\n".encode())
+            try:
+                err_chunk = json.dumps({"error": {"message": str(exc), "type": "server_error"}})
+                await response.write(f"data: {err_chunk}\n\n".encode())
+            except Exception:
+                pass  # client already disconnected — nothing to write to
 
-        await response.write_eof()
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
         return response
 
     else:
