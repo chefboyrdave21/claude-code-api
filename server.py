@@ -41,6 +41,7 @@ REQUEST_TIMEOUT = 600  # seconds per claude call (opus can be slow with large co
 QUEUE_TIMEOUT = 90     # seconds to wait for semaphore before giving up
 
 VALID_MODELS = {
+    "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
@@ -50,20 +51,22 @@ VALID_MODELS = {
 # Map OpenAI / shorthand / provider-prefixed names → canonical claude model IDs
 MODEL_ALIASES: dict[str, str] = {
     # GPT compatibility
-    "gpt-4":              "claude-opus-4-6",
+    "gpt-4":              "claude-opus-4-7",
     "gpt-4o":             "claude-sonnet-4-6",
-    "gpt-4-turbo":        "claude-opus-4-6",
+    "gpt-4-turbo":        "claude-opus-4-7",
     "gpt-4o-mini":        "claude-haiku-4-5",
     "gpt-3.5-turbo":      "claude-haiku-4-5",
     "gpt-3.5-turbo-16k":  "claude-haiku-4-5",
     # Shorthand
-    "opus":               "claude-opus-4-6",
+    "opus":               "claude-opus-4-7",
     "sonnet":             "claude-sonnet-4-6",
     "haiku":              "claude-haiku-4-5",
     # Provider-prefixed (openclaw strips prefix before routing, but handle here too)
+    "claude/claude-opus-4-7":    "claude-opus-4-7",
     "claude/claude-opus-4-6":    "claude-opus-4-6",
     "claude/claude-sonnet-4-6":  "claude-sonnet-4-6",
     "claude/claude-haiku-4-5":   "claude-haiku-4-5",
+    "anthropic/claude-opus-4-7":   "claude-opus-4-7",
     "anthropic/claude-opus-4-6":   "claude-opus-4-6",
     "anthropic/claude-sonnet-4-6": "claude-sonnet-4-6",
     "anthropic/claude-haiku-4-5":  "claude-haiku-4-5",
