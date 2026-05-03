@@ -37,7 +37,7 @@ CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 
 PORT = 18782
 DEFAULT_MODEL = "claude-sonnet-4-6"
-REQUEST_TIMEOUT = 600  # seconds per claude call (opus can be slow with large context)
+REQUEST_TIMEOUT = 1800  # seconds per claude call (opus can be slow with large context)
 QUEUE_TIMEOUT = 90     # seconds to wait for semaphore before giving up
 
 VALID_MODELS = {
@@ -81,7 +81,9 @@ _sem: asyncio.Semaphore | None = None
 def sem() -> asyncio.Semaphore:
     global _sem
     if _sem is None:
-        _sem = asyncio.Semaphore(1)
+        n = max(1, int(os.environ.get("CCAPI_MAX_CONCURRENT", "3")))
+        _sem = asyncio.Semaphore(n)
+        log.info("claude subprocess concurrency: %d", n)
     return _sem
 
 
