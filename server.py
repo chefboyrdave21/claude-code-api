@@ -41,6 +41,7 @@ REQUEST_TIMEOUT = 1800  # seconds per claude call (opus can be slow with large c
 QUEUE_TIMEOUT = 90     # seconds to wait for semaphore before giving up
 
 VALID_MODELS = {
+    "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
@@ -48,24 +49,28 @@ VALID_MODELS = {
     "claude-haiku-4-5-20251001",
 }
 
+MODEL_REFRESH_INTERVAL = 3600  # seconds between auto-discovery refreshes
+
 # Map OpenAI / shorthand / provider-prefixed names → canonical claude model IDs
 MODEL_ALIASES: dict[str, str] = {
     # GPT compatibility
-    "gpt-4":              "claude-opus-4-7",
+    "gpt-4":              "claude-opus-4-8",
     "gpt-4o":             "claude-sonnet-4-6",
-    "gpt-4-turbo":        "claude-opus-4-7",
+    "gpt-4-turbo":        "claude-opus-4-8",
     "gpt-4o-mini":        "claude-haiku-4-5",
     "gpt-3.5-turbo":      "claude-haiku-4-5",
     "gpt-3.5-turbo-16k":  "claude-haiku-4-5",
     # Shorthand
-    "opus":               "claude-opus-4-7",
+    "opus":               "claude-opus-4-8",
     "sonnet":             "claude-sonnet-4-6",
     "haiku":              "claude-haiku-4-5",
-    # Provider-prefixed (openclaw strips prefix before routing, but handle here too)
+    # Provider-prefixed (handle both claude/ and anthropic/ prefixes)
+    "claude/claude-opus-4-8":    "claude-opus-4-8",
     "claude/claude-opus-4-7":    "claude-opus-4-7",
     "claude/claude-opus-4-6":    "claude-opus-4-6",
     "claude/claude-sonnet-4-6":  "claude-sonnet-4-6",
     "claude/claude-haiku-4-5":   "claude-haiku-4-5",
+    "anthropic/claude-opus-4-8":   "claude-opus-4-8",
     "anthropic/claude-opus-4-7":   "claude-opus-4-7",
     "anthropic/claude-opus-4-6":   "claude-opus-4-6",
     "anthropic/claude-sonnet-4-6": "claude-sonnet-4-6",
@@ -76,6 +81,7 @@ MODEL_ALIASES: dict[str, str] = {
 
 log = logging.getLogger("claude-code-api")
 _sem: asyncio.Semaphore | None = None
+_last_model_refresh: float = 0.0
 
 
 def sem() -> asyncio.Semaphore:
@@ -309,6 +315,25 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
     return text, usage
 
 
+async def _refresh_models() -> None:
+    """Discover available models from the Anthropic API and merge into VALID_MODELS."""
+    global _last_model_refresh
+    try:
+        token = _get_oauth_token()
+        client = anthropic_sdk.AsyncAnthropic(api_key=token)
+        page = await asyncio.wait_for(client.models.list(limit=100), timeout=15)
+        discovered = {m.id for m in page.data if m.id.startswith("claude-")}
+        if discovered:
+            added = discovered - VALID_MODELS
+            VALID_MODELS.update(discovered)
+            _last_model_refresh = time.time()
+            if added:
+                log.info("Model discovery: +%d new — %s", len(added), ", ".join(sorted(added)))
+            log.info("Model discovery complete: %d models", len(VALID_MODELS))
+    except Exception as exc:
+        log.warning("Model discovery failed, using static list: %s", exc)
+
+
 def _get_oauth_token() -> str:
     """Read the current OAuth access token from Claude Code credentials."""
     with open(CREDS_PATH) as f:
@@ -381,6 +406,8 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def handle_models(request: web.Request) -> web.Response:
+    if time.time() - _last_model_refresh > MODEL_REFRESH_INTERVAL:
+        asyncio.create_task(_refresh_models())
     now = int(time.time())
     models = [
         {
@@ -490,8 +517,13 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
 # ─── App factory & main ───────────────────────────────────────────────────────
 
+async def _on_startup(app: web.Application) -> None:
+    asyncio.create_task(_refresh_models())
+
+
 def build_app() -> web.Application:
     app = web.Application()
+    app.on_startup.append(_on_startup)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
