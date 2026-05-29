@@ -36,7 +36,7 @@ CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 PORT = 18782
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-opus-4-8"
 REQUEST_TIMEOUT = 1800  # seconds per claude call (opus can be slow with large context)
 QUEUE_TIMEOUT = 90     # seconds to wait for semaphore before giving up
 
