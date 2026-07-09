@@ -274,6 +274,12 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
         "--output-format", "json",
         "--no-session-persistence",
     ]
+    # By default, don't boot the ~/.claude.json MCP servers (skcapstone/skchat/
+    # skmemory) on every spawn — this is a text-completion API, the caller brings
+    # its own tools, and loading them roughly DOUBLES per-request latency
+    # (~6s → ~3s). Set CLAUDE_API_LOAD_MCP=1 to restore MCP tools inside the wrapper.
+    if os.environ.get("CLAUDE_API_LOAD_MCP", "").strip().lower() not in ("1", "true", "yes"):
+        cmd += ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
 
     log.debug("Running (non-stream): %s | stdin=%d chars", " ".join(cmd[:6]) + " ...", len(stdin_text))
 
