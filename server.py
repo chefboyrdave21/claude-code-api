@@ -7,7 +7,8 @@ can use Claude Code's subscription-covered inference instead of a raw API key.
 
 Architecture:
   - aiohttp HTTP server on port 18782
-  - asyncio.Semaphore(1) serialises claude invocations (single-threaded CLI)
+  - asyncio.Semaphore(CCAPI_MAX_CONCURRENT, default 3) caps concurrent claude
+    invocations so background crons don't block interactive turns
   - All modes: claude --print --output-format json  (reliable, no stream-json timeouts)
   - Streaming responses: result is emitted as chunked SSE after the subprocess finishes
     (avoids the 300s timeout caused by opus extended-thinking blocking stream-json stdout)
