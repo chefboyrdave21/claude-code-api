@@ -1,65 +1,102 @@
 # Claude Code API
 
-OpenAI-compatible `/v1/chat/completions` wrapper around the `claude` CLI.
-Routes inference through your Claude Code subscription — no API key needed.
+An OpenAI-compatible `/v1/chat/completions` endpoint in front of the `claude` CLI.
+Point any OpenAI-shaped client at it and inference runs through your existing Claude
+Code subscription instead of a metered API key.
+
+> ### ⚠️ This is an unauthenticated endpoint that runs arbitrary commands
+>
+> The server spawns `claude --print --dangerously-skip-permissions`, so Claude Code's
+> Bash, Read, Write, and Edit tools are available with every permission prompt
+> disabled. There is no API key, no token, and no authorization check anywhere in this
+> repository. **The body of an HTTP request is an instruction that can execute code as
+> the user running the server.** It binds `127.0.0.1` by default and that bind is the
+> only thing protecting it. Read [`SECURITY.md`](SECURITY.md) before running it, and
+> do not expose the port.
 
 ## How it works
 
-1. Receives an OpenAI-format `POST /v1/chat/completions` request.
-2. Converts the `messages` array → a single prompt string.
-3. Invokes `claude --print --output-format json --no-session-persistence --model <model>`.
-4. Returns the response in OpenAI-compatible JSON (or chunked SSE if `stream: true`).
-5. Concurrent requests are serialised through a queue — the Claude CLI is single-threaded.
+1. Receives an OpenAI-format `POST /v1/chat/completions`.
+2. Flattens the `messages` array into a single prompt string, piped to the subprocess
+   on **stdin** (a CLI argument overflows with `[Errno 7] Argument list too long` on
+   large contexts).
+3. Invokes `claude --print --dangerously-skip-permissions --model <model>
+   --output-format json --no-session-persistence`, holding an
+   `asyncio.Semaphore` so no more than `CCAPI_MAX_CONCURRENT` (default **3**)
+   subprocesses run at once.
+4. Returns an OpenAI-compatible completion object, or chunked SSE if `stream: true`.
 
-> **Why `--output-format json` instead of `stream-json`?**  
-> `claude-opus-4-6` with extended thinking blocks stdout for several minutes before
-> emitting any text in stream-json mode, causing spurious timeouts. JSON mode runs
-> the full inference and returns one clean payload — reliable for all models.
-> Streaming clients still receive SSE chunks; the text is chunked after the subprocess
-> finishes.
+**Requests containing images take a different path.** `server.py` detects
+`image_url` content blocks and calls the Anthropic SDK directly rather than the CLI,
+authenticating with the OAuth access token read from `~/.claude/.credentials.json`.
+That path does **not** consume the semaphore.
+
+> **Why `--output-format json` instead of `stream-json`?**
+> Opus with extended thinking blocks stdout for minutes before emitting any text in
+> stream-json mode, which reads as a timeout. JSON mode runs the full inference and
+> returns one clean payload. Streaming clients still get SSE: the completed text is
+> chunked on word boundaries after the subprocess exits.
 
 ## Prerequisites
 
-- `claude` CLI installed and authenticated (`claude auth status`)
-- **Node server:** Node.js ≥ 18 + `npm install`
-- **Python server:** Python 3.11+ with `aiohttp` (`pip install aiohttp`)
+- `claude` CLI installed, authenticated, and on the server process's `PATH`.
+- **Python server (the one that is actually maintained):** Python 3.11+ with
+  `aiohttp` and `anthropic`. The `anthropic` SDK is **required**, not optional: it is
+  imported at module scope and is used for hourly model discovery even if you never
+  send an image.
+  ```bash
+  pip install aiohttp anthropic
+  ```
+- **Node server (legacy, see below):** Node.js 18+ and `npm install`.
 
-## Servers
+## The two servers are not equals
 
-Two interchangeable implementations — pick one:
+| File | Runtime | Status |
+|---|---|---|
+| `server.py` | Python / aiohttp | **Maintained. This is what runs.** |
+| `server.js` | Node / Express | **Legacy. Unmaintained, not deployed.** |
 
-| File | Runtime | Default port | Notes |
-|------|---------|-------------|-------|
-| `server.js` | Node.js / Express | 3456 | Original implementation |
-| `server.py` | Python / aiohttp | 18782 | Alternative; used for the local user service |
-
-### Node.js
+`server.js` was the original implementation and has since drifted: its default model
+is `claude-sonnet-4-6`, its `VALID_MODELS` set has no `claude-opus-4-7` or
+`claude-opus-4-8`, it has no vision path, and it has no model auto-discovery. It is
+kept for reference. Nothing on the maintainer's fleet runs it. Prefer `server.py`
+unless you specifically want the Node version, and expect to update it yourself.
 
 ```bash
-npm install
-node server.js            # port 3456
-PORT=18782 node server.js # custom port
+python3 server.py                 # 127.0.0.1:18782
+python3 server.py --port 3456     # different port
+python3 server.py --host 0.0.0.0  # DO NOT. See SECURITY.md.
+python3 server.py --debug         # verbose logging
 ```
 
-### Python
+## Configuration
 
-```bash
-pip install aiohttp
-python3 server.py                   # port 18782
-python3 server.py --port 3456       # custom port
-python3 server.py --debug           # verbose logging
-```
+### `server.py`
 
-## Environment variables (Node)
+| Setting | Where | Default | Notes |
+|---|---|---|---|
+| listen port | `--port` | `18782` | |
+| listen host | `--host` | `127.0.0.1` | Leave it. |
+| `CCAPI_MAX_CONCURRENT` | env | `3` | Concurrent `claude` subprocesses. |
+| `CLAUDE_API_LOAD_MCP` | env | unset (off) | `1` boots the host's MCP servers inside every subprocess. Roughly doubles per-request latency and widens the blast radius. This is a security setting. |
+| `REQUEST_TIMEOUT` | constant, `server.py` | `1800` s | Per-call ceiling. Not an env var. |
+| `QUEUE_TIMEOUT` | constant, `server.py` | `90` s | How long a request waits for a semaphore slot before giving up. |
+| `DEFAULT_MODEL` | constant, `server.py` | `claude-opus-4-8` | Used for an unrecognised model name. |
 
-| Variable  | Default   | Description |
-|-----------|-----------|-------------|
-| `PORT`    | `3456`    | HTTP listen port |
-| `TIMEOUT` | `600000`  | Max ms per claude call (10 min) |
+### `server.js` (legacy)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PORT` | `3456` | |
+| `TIMEOUT` | `600000` ms | |
 
 ## Endpoints
 
-### POST /v1/chat/completions
+`POST /v1/chat/completions`, `GET /v1/models`, and `GET /health`. The two `/v1` routes
+are **also** registered without the prefix (`/chat/completions`, `/models`) for
+clients that do not add it.
+
+### `POST /v1/chat/completions`
 
 ```json
 {
@@ -72,75 +109,108 @@ python3 server.py --debug           # verbose logging
 }
 ```
 
-**Non-streaming response:** standard OpenAI chat completion object.  
-**Streaming (`"stream": true`):** `text/event-stream` SSE in OpenAI delta format, terminated with `data: [DONE]`.
+Non-streaming returns a standard OpenAI chat completion object. Streaming returns
+`text/event-stream` SSE in OpenAI delta format, terminated with `data: [DONE]`.
+Errors return HTTP 500 with `{"error": {"message": ..., "type": "server_error"}}`,
+or, mid-stream, an error object emitted as one final SSE frame.
 
-### GET /v1/models
+### `GET /v1/models`
 
-Returns the list of supported Claude model IDs.
+Returns the current model list. The set is seeded from a static list in `server.py`
+and then **refreshed from the Anthropic API at most once an hour**, so a newly
+released model appears without a code change. Discovery failures are logged and
+fall back to the static seed.
 
-### GET /health
+### `GET /health`
 
 ```json
-{ "status": "ok", "queue_depth": 0, "running": false, "uptime_seconds": 42 }
+{ "status": "ok", "service": "claude-code-api", "port": 18782 }
 ```
 
-## Supported models
+> Known wart: the reported `port` is the module-level `PORT` constant, not the value
+> passed to `--port`. If you start the server on a non-default port, `/health` still
+> reports `18782`. Trust `ss -tlnp` over this field.
 
-| Model ID | Alias |
-|----------|-------|
-| `claude-opus-4-6` | `opus`, `gpt-4`, `gpt-4-turbo` |
-| `claude-sonnet-4-6` | `sonnet`, `gpt-4o`, `claude-code` |
-| `claude-haiku-4-5` | `haiku`, `gpt-3.5-turbo`, `gpt-4o-mini` |
+## Models
 
-Provider-prefixed names (`claude-code/claude-sonnet-4-6`) are also accepted.
+`DEFAULT_MODEL` is **`claude-opus-4-8`**. The static seed set is `claude-opus-4-8`,
+`claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`, and
+`claude-haiku-4-5-20251001`, plus whatever hourly discovery adds.
 
-## Local user service (port 18782)
+Aliases are accepted so OpenAI-shaped clients work unmodified:
 
-For the SKCapstone / OpenClaw setup, the Python server runs as a systemd user unit:
+| You send | You get |
+|---|---|
+| `gpt-4`, `gpt-4-turbo`, `opus` | `claude-opus-4-8` |
+| `gpt-4o`, `sonnet` | `claude-sonnet-4-6` |
+| `gpt-4o-mini`, `gpt-3.5-turbo`, `gpt-3.5-turbo-16k`, `haiku` | `claude-haiku-4-5` |
+
+Provider-prefixed names are accepted too: explicit `claude/...` and `anthropic/...`
+entries are mapped, and any other `prefix/model` has the prefix stripped before
+lookup. An unrecognised name logs a warning and falls back to `DEFAULT_MODEL` rather
+than erroring.
+
+## Running it as a service
+
+`claude-code-api.service` in this repository is a systemd **user** unit. It must be a
+user unit: the subprocess needs the invoking user's `HOME`, `PATH`, and
+`~/.claude/.credentials.json`.
 
 ```bash
-# Install (one-time)
 cp claude-code-api.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now claude-code-api.service
-
-# Status / logs
 systemctl --user status claude-code-api.service
 journalctl --user -u claude-code-api.service -f
 ```
 
-The service file in this repo is the system-level template (runs under a specific user,
-installs to `/opt/claude-code-api`). See the comments in the file to adapt it.
+Adjust the checkout path in `ExecStart` if you did not clone to
+`~/clawd/skcapstone-repos/claude-code-api`. [`SOP.md`](SOP.md) documents the
+maintainer's live deployment, including where it currently differs from this file.
 
-## OpenClaw configuration
+## Using it from a client
 
-Add a provider in `~/.openclaw/openclaw.json`:
+Any OpenAI-compatible client works. The maintainer's setup consumes it from
+**Hermes**, configured in `~/.hermes/config.yaml` as a provider:
 
-```json
-{
-  "models": {
-    "providers": {
-      "claude-code": {
-        "baseUrl": "http://127.0.0.1:18782/v1",
-        "apiKey": "none",
-        "api": "openai-completions",
-        "models": [
-          { "id": "claude-opus-4-6",   "name": "Claude Opus 4.6 (via CC)",   "contextWindow": 200000, "maxTokens": 32000 },
-          { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (via CC)", "contextWindow": 200000, "maxTokens": 16000 },
-          { "id": "claude-haiku-4-5",  "name": "Claude Haiku 4.5 (via CC)",  "contextWindow": 200000, "maxTokens": 8192 }
-        ]
-      }
-    }
-  }
-}
+```yaml
+  - name: claude-code
+    base_url: http://127.0.0.1:18782/v1
+    api_key: ''
+    api_mode: chat_completions
+    models:
+      - claude-opus-4-8
+      - claude-opus-4-7
+      - claude-opus-4-6
 ```
 
-Set your agent's primary model to `claude-code/claude-sonnet-4-6`.
+`api_key` is empty because the endpoint does not check one. That is the whole
+security posture: see [`SECURITY.md`](SECURITY.md).
 
 ## Known limitations
 
-- **Single-threaded:** High request rates queue, not fail. Latency scales linearly.
-- **No tool_calls passthrough:** Tools are handled internally by Claude Code, not exposed in the OpenAI format.
-- **No cross-request memory:** Each call uses `--no-session-persistence`.
-- **Streaming granularity:** SSE chunks are word-boundary splits of the completed response, not token-by-token.
+- **No authentication.** By design, and the reason for the loopback bind.
+- **Concurrency is capped, not unlimited.** Default 3. Beyond that, requests wait up
+  to `QUEUE_TIMEOUT` (90 s) for a slot and then fail.
+- **No `tool_calls` passthrough.** Tools run inside Claude Code and are not surfaced
+  in the OpenAI response format. A client cannot drive tool use through this API.
+- **No cross-request memory.** Every call uses `--no-session-persistence`.
+- **Streaming is not token-by-token.** SSE chunks are word-boundary splits of an
+  already-complete response, so time-to-first-token equals full generation time.
+- **`usage` counts come from the CLI's own report** and are `0` when it does not
+  supply them.
+- **No test suite.** `npm test` is still the `npm init` placeholder that exits 1.
+  There is no CI that runs the server. Changes are verified by hand.
+
+## Documentation
+
+| File | What it covers |
+|---|---|
+| [`SOP.md`](SOP.md) | Architecture, deploy, rollback, troubleshooting, live deployment facts. |
+| [`SECURITY.md`](SECURITY.md) | Threat model, credential handling, disclosure. **Read before running.** |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to change it, and how to verify a change without a test suite. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Reconstructed from git history. |
+
+## License
+
+ISC. See [`LICENSE`](LICENSE), which matches the `license` field in `package.json`.
