@@ -1,26 +1,54 @@
+# claude-code-api: systemd USER unit.
+#
+# Install with:
+#   cp claude-code-api.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now claude-code-api.service
+#
+# This is a USER unit, not a system unit. That is deliberate: the server spawns
+# `claude --print`, which needs the invoking user's HOME, PATH, and
+# ~/.claude/.credentials.json. Running it system-wide as root or as a dedicated
+# service account would not have those, and would widen an endpoint that already
+# executes arbitrary commands as whoever runs it. See SECURITY.md.
+#
+# %h expands to the user's home directory. Adjust the checkout path below if you
+# cloned somewhere other than ~/clawd/skcapstone-repos/claude-code-api.
+
 [Unit]
-Description=Claude Code API Wrapper
+Description=Claude Code API: OpenAI-compatible wrapper for `claude --print` (loopback :18782)
+Documentation=https://github.com/chefboyrdave21/claude-code-api/blob/main/SOP.md
 After=network.target
 
 [Service]
 Type=simple
-User=%i
-WorkingDirectory=/opt/claude-code-api
-ExecStart=/usr/bin/node /opt/claude-code-api/server.js
-Restart=on-failure
-RestartSec=5s
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=claude-code-api
+ExecStart=%h/.skenv/bin/python3 %h/clawd/skcapstone-repos/claude-code-api/server.py --port 18782
+Restart=always
+RestartSec=5
+KillMode=control-group
 
-# Configurable via environment overrides or a drop-in file:
-#   /etc/systemd/system/claude-code-api.service.d/override.conf
-Environment=PORT=3456
-Environment=TIMEOUT=120000
-# NODE_ENV=production
+# prb-bd79dd5f: RestartSec x (Burst - 1) must be >= StartLimitIntervalSec, or the
+# start limiter never engages and a 203/EXEC unit retries forever. This unit sets
+# no StartLimitBurst, so it relies on escalating backoff instead of a hard stop.
+# That is intentional (SERVICE_UNIT_STANDARD Tier A: it must never permanently
+# die), but it means a broken ExecStart will loop. Watch the journal after any
+# change to the path above.
+RestartSteps=8
+RestartMaxDelaySec=5min
 
-# Optional: run as a specific user
-# User=myuser
+Environment=HOME=%h
+Environment=TMPDIR=/tmp
+
+# Cap concurrent `claude --print` subprocesses. 3 lets background jobs run
+# without queueing behind a single interactive turn. See server.py `sem()`.
+Environment=CCAPI_MAX_CONCURRENT=3
+
+# SECURITY: setting CLAUDE_API_LOAD_MCP=1 boots the host's configured MCP servers
+# inside every spawned subprocess, widening the blast radius from local tools to
+# everything those servers expose. Leave it unset. See SECURITY.md.
+
+# `claude` must be on PATH. Set it explicitly: a user unit does not inherit your
+# login shell's PATH.
+Environment=PATH=%h/.skenv/bin:%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
