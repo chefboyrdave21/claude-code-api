@@ -41,17 +41,22 @@ DEFAULT_MODEL = "claude-opus-5"
 REQUEST_TIMEOUT = 1800  # seconds per claude call (opus can be slow with large context)
 QUEUE_TIMEOUT = 90     # seconds to wait for semaphore before giving up
 
-# This static list is the REAL list, not a fallback. `_refresh_models()` below
-# discovers from the Anthropic API using an API key, but this wrapper is
-# deliberately subscription-backed (it shells out to `claude --print` so calls
-# bill against the plan, see the gateway's anthropic backend comment). There is
-# no valid API key here by design, so discovery has been 401ing since at least
-# 2026-08-15 and silently falling back here. A stale static list and a working
-# one look identical from /v1/models, which is how this list sat two releases
-# behind without anyone noticing. Keep it current by hand.
+# SEED list only. `_refresh_models()` discovers the live set from the Anthropic
+# API on boot and hourly, and merges into this set, so new models appear without
+# a code change. The merge is additive only: discovery can never remove a model
+# from here, so an API hiccup cannot shrink what this wrapper will serve.
 #
-# Every entry below was verified against the installed CLI (2.1.233) on
-# 2026-08-16 with `claude --print --model <id>`, not copied from docs.
+# This seed exists so the wrapper is useful before the first refresh completes
+# and if discovery is ever down. Every entry was verified against the installed
+# CLI (2.1.233) on 2026-08-16 with `claude --print --model <id>`, not copied
+# from documentation.
+#
+# History worth keeping: discovery was silently broken from at least 2026-08-15
+# because the OAuth token was passed as `api_key=` (sent as `x-api-key`) rather
+# than `auth_token=` (sent as `Authorization: Bearer`). It 401ed every hour and
+# fell back here, and because a stale list and a fresh one produce an identical
+# /v1/models response, nothing downstream could tell. That is why /health now
+# reports discovery state explicitly.
 VALID_MODELS = {
     # Claude 5 family (current)
     "claude-opus-5",
@@ -108,6 +113,10 @@ MODEL_ALIASES: dict[str, str] = {
 log = logging.getLogger("claude-code-api")
 _sem: asyncio.Semaphore | None = None
 _last_model_refresh: float = 0.0
+# Discovery health, surfaced on /health. False until a refresh actually succeeds,
+# so "never worked" is distinguishable from "worked and is current".
+_discovery_ok: bool = False
+_discovery_error: str | None = None
 
 
 def sem() -> asyncio.Semaphore:
@@ -348,22 +357,50 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
 
 
 async def _refresh_models() -> None:
-    """Discover available models from the Anthropic API and merge into VALID_MODELS."""
-    global _last_model_refresh
+    """Discover available models from the Anthropic API and merge into VALID_MODELS.
+
+    Auth: the token in ~/.claude/.credentials.json is an OAuth access token, and
+    an OAuth token must be sent as `Authorization: Bearer`, which the SDK spells
+    `auth_token=`. It was previously passed as `api_key=`, which the SDK sends as
+    the `x-api-key` header, and Anthropic rejects that with
+    "authentication_error: API key is invalid". Discovery had therefore returned
+    401 on every attempt since at least 2026-08-15 while the service looked
+    healthy, because the failure path just falls back to the static list.
+
+    Merge-only, never subtractive: a discovery result can add models but can
+    never remove one, so a partial or empty response cannot shrink what this
+    wrapper will serve.
+    """
+    global _last_model_refresh, _discovery_ok, _discovery_error
     try:
         token = _get_oauth_token()
-        client = anthropic_sdk.AsyncAnthropic(api_key=token)
+        client = anthropic_sdk.AsyncAnthropic(auth_token=token)
         page = await asyncio.wait_for(client.models.list(limit=100), timeout=15)
         discovered = {m.id for m in page.data if m.id.startswith("claude-")}
         if discovered:
             added = discovered - VALID_MODELS
             VALID_MODELS.update(discovered)
             _last_model_refresh = time.time()
+            _discovery_ok = True
+            _discovery_error = None
             if added:
                 log.info("Model discovery: +%d new — %s", len(added), ", ".join(sorted(added)))
             log.info("Model discovery complete: %d models", len(VALID_MODELS))
+        else:
+            # A 200 that lists nothing is not success. Say so rather than
+            # recording a refresh that discovered nothing.
+            _discovery_ok = False
+            _discovery_error = "API returned no claude-* models"
+            log.error("Model discovery returned an EMPTY model list; keeping the static list")
     except Exception as exc:
-        log.warning("Model discovery failed, using static list: %s", exc)
+        _discovery_error = str(exc)
+        # ERROR, not WARNING, and it says what the consequence is. A stale list
+        # and a fresh one produce an identical /v1/models response, so the log
+        # is the only place this is visible. /health carries it too.
+        log.error(
+            "Model discovery FAILED, serving a possibly STALE static list of %d models: %s",
+            len(VALID_MODELS), exc,
+        )
 
 
 def _get_oauth_token() -> str:
@@ -434,7 +471,24 @@ async def _fake_stream_chunks(text: str, chunk_size: int = 80) -> AsyncIterator[
 # ─── HTTP Handlers ────────────────────────────────────────────────────────────
 
 async def handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "claude-code-api", "port": PORT})
+    # model_discovery is reported explicitly because a stale model list and a
+    # freshly discovered one produce an identical /v1/models response. Without
+    # this, "discovery has been 401ing for days" is indistinguishable from
+    # "discovery is working", which is exactly how the list went two
+    # generations stale unnoticed.
+    age = (time.time() - _last_model_refresh) if _last_model_refresh else None
+    return web.json_response({
+        "status": "ok",
+        "service": "claude-code-api",
+        "port": PORT,
+        "model_discovery": {
+            "ok": _discovery_ok,
+            "last_success_age_seconds": round(age) if age is not None else None,
+            "stale": _discovery_ok and age is not None and age > MODEL_REFRESH_INTERVAL * 2,
+            "models_served": len(VALID_MODELS),
+            "last_error": _discovery_error,
+        },
+    })
 
 
 async def handle_models(request: web.Request) -> web.Response:
