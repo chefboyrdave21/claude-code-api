@@ -37,11 +37,27 @@ CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 PORT = 18782
-DEFAULT_MODEL = "claude-opus-4-8"
+DEFAULT_MODEL = "claude-opus-5"
 REQUEST_TIMEOUT = 1800  # seconds per claude call (opus can be slow with large context)
 QUEUE_TIMEOUT = 90     # seconds to wait for semaphore before giving up
 
+# This static list is the REAL list, not a fallback. `_refresh_models()` below
+# discovers from the Anthropic API using an API key, but this wrapper is
+# deliberately subscription-backed (it shells out to `claude --print` so calls
+# bill against the plan, see the gateway's anthropic backend comment). There is
+# no valid API key here by design, so discovery has been 401ing since at least
+# 2026-08-15 and silently falling back here. A stale static list and a working
+# one look identical from /v1/models, which is how this list sat two releases
+# behind without anyone noticing. Keep it current by hand.
+#
+# Every entry below was verified against the installed CLI (2.1.233) on
+# 2026-08-16 with `claude --print --model <id>`, not copied from docs.
 VALID_MODELS = {
+    # Claude 5 family (current)
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    # Claude 4.x (retained so anything pinned to an explicit id keeps working)
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
@@ -55,17 +71,26 @@ MODEL_REFRESH_INTERVAL = 3600  # seconds between auto-discovery refreshes
 # Map OpenAI / shorthand / provider-prefixed names → canonical claude model IDs
 MODEL_ALIASES: dict[str, str] = {
     # GPT compatibility
-    "gpt-4":              "claude-opus-4-8",
-    "gpt-4o":             "claude-sonnet-4-6",
-    "gpt-4-turbo":        "claude-opus-4-8",
+    "gpt-4":              "claude-opus-5",
+    "gpt-4o":             "claude-sonnet-5",
+    "gpt-4-turbo":        "claude-opus-5",
     "gpt-4o-mini":        "claude-haiku-4-5",
     "gpt-3.5-turbo":      "claude-haiku-4-5",
     "gpt-3.5-turbo-16k":  "claude-haiku-4-5",
-    # Shorthand
-    "opus":               "claude-opus-4-8",
-    "sonnet":             "claude-sonnet-4-6",
+    # Shorthand. These track the CURRENT family, so a caller asking for "opus"
+    # gets today's opus rather than whichever one was current when this file was
+    # last touched. Anything needing a specific generation must pin the full id.
+    "opus":               "claude-opus-5",
+    "sonnet":             "claude-sonnet-5",
     "haiku":              "claude-haiku-4-5",
+    "fable":              "claude-fable-5",
     # Provider-prefixed (handle both claude/ and anthropic/ prefixes)
+    "claude/claude-opus-5":      "claude-opus-5",
+    "claude/claude-sonnet-5":    "claude-sonnet-5",
+    "claude/claude-fable-5":     "claude-fable-5",
+    "anthropic/claude-opus-5":   "claude-opus-5",
+    "anthropic/claude-sonnet-5": "claude-sonnet-5",
+    "anthropic/claude-fable-5":  "claude-fable-5",
     "claude/claude-opus-4-8":    "claude-opus-4-8",
     "claude/claude-opus-4-7":    "claude-opus-4-7",
     "claude/claude-opus-4-6":    "claude-opus-4-6",
