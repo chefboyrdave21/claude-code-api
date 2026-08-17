@@ -107,7 +107,11 @@ VALID_MODELS = {
     "claude-haiku-4-5-20251001",
 }
 
-MODEL_REFRESH_INTERVAL = 3600  # seconds between auto-discovery refreshes
+# Interval for the background refresh loop (_refresh_loop), and the TTL the
+# lazy handle_models() path checks. Both, deliberately: the loop is what makes
+# refreshes actually periodic, and the lazy check stays as a cheap backstop if
+# the loop ever dies.
+MODEL_REFRESH_INTERVAL = 3600  # seconds
 
 # Map OpenAI / shorthand / provider-prefixed names → canonical claude model IDs
 MODEL_ALIASES: dict[str, str] = {
@@ -735,8 +739,45 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
 # ─── App factory & main ───────────────────────────────────────────────────────
 
+async def _refresh_loop() -> None:
+    """Refresh the model list on a real interval, forever.
+
+    Without this, discovery ran exactly ONCE at startup and then only lazily,
+    from handle_models(), when a caller happened to request /v1/models past the
+    TTL. `MODEL_REFRESH_INTERVAL` reads like a period and was actually a
+    cache-expiry checked on one endpoint, so if nothing asked, nothing refreshed.
+
+    Measured on the live service before this existed: uptime 19.5h, hourly
+    interval, and `last_success_age_seconds` was 70069. One refresh in nineteen
+    hours. The gateway keeps its own catalog and rarely re-asks, so in practice
+    the model list was frozen at boot and a newly released model would not have
+    appeared until someone restarted the service.
+
+    It never lets an exception end the loop: a transient network failure must
+    cost one cycle, not all future ones. That is the same failure this whole
+    file has now hit twice, a mechanism that stops working while continuing to
+    look alive, so the loop is deliberately hard to kill and /health reports
+    `stale` when it has silently stopped anyway.
+    """
+    while True:
+        try:
+            await asyncio.sleep(MODEL_REFRESH_INTERVAL)
+            await _refresh_models()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("Model refresh loop iteration failed, continuing: %s", exc)
+
+
 async def _on_startup(app: web.Application) -> None:
     asyncio.create_task(_refresh_models())
+    app["refresh_loop"] = asyncio.create_task(_refresh_loop())
+
+
+async def _on_cleanup(app: web.Application) -> None:
+    task = app.get("refresh_loop")
+    if task is not None:
+        task.cancel()
 
 
 def build_app() -> web.Application:
@@ -746,6 +787,7 @@ def build_app() -> web.Application:
     # aliases below.
     app = web.Application(middlewares=[auth_middleware])
     app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_post("/v1/chat/completions", handle_chat_completions)

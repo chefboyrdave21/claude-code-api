@@ -14,6 +14,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Model discovery now refreshes on a real interval.** It ran once at startup
+  and then only lazily, from `handle_models()`, when a caller happened to request
+  `/v1/models` past the TTL. `MODEL_REFRESH_INTERVAL` read like a period and was
+  actually a cache expiry checked on one endpoint, so if nothing asked, nothing
+  refreshed. Measured on the live service: uptime 19.5h on an hourly setting,
+  `last_success_age_seconds` 70069. One refresh in nineteen hours. The gateway
+  keeps its own catalog and rarely re-asks, so in practice the list was frozen at
+  boot and a newly released model would not appear until a restart.
+  `_refresh_loop` now sleeps and refreshes forever, and never lets one failed
+  cycle end the loop. The lazy check stays as a cheap backstop if the loop dies.
+
 Everything since `v1.4.1` (2026-04-21) is untagged, so the tip is materially ahead of
 the last tag.
 
