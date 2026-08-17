@@ -5,22 +5,28 @@ client can run inference on a Claude Code subscription instead of a metered API 
 Single-file aiohttp server, loopback only. On the maintainer's fleet its one consumer
 is Hermes, which lists it as the `claude-code` provider.
 
-This SOP is deliberately short. The service is one ~570-line Python file with three
-routes and no database, no queue broker, and no test suite. Padding it to match a
-larger service's SOP would mean inventing procedure that does not exist.
+This SOP is deliberately short. The service is one Python file with three routes and
+no database and no queue broker. Padding it to match a larger service's SOP would mean
+inventing procedure that does not exist.
 
 ## 1. Overview
 
-**What it owns.** Accepting OpenAI `chat/completions` requests on loopback,
-flattening them into a prompt, spawning `claude --print` under a concurrency cap,
-and reshaping the result into OpenAI JSON or SSE. Plus a model list that
-self-refreshes from the Anthropic API.
+**What it owns.** Authenticating each request against a shared secret, accepting
+OpenAI `chat/completions` requests on loopback, flattening them into a prompt,
+spawning `claude --print` under a concurrency cap, and reshaping the result into
+OpenAI JSON or SSE. Plus a model list that self-refreshes from the Anthropic API.
+
+**What it does for authorization.** One shared secret, `CCAPI_TOKEN`, required on
+every route except `GET /health`, presented as `Authorization: Bearer <token>` or
+`X-CCAPI-Token: <token>`, compared with `hmac.compare_digest`. Unset or blank means
+every authenticated route returns `401`; there is no permissive fallback. Read
+[`SECURITY.md`](SECURITY.md) for the rationale and the storage and rotation
+procedure. It is not optional reading.
 
 **What it explicitly does NOT do.**
 
-- **No authentication or authorization of any kind.** Not a gap to be fixed later in
-  this document: there is no code path anywhere in the repo that inspects a header,
-  token, or origin. See [`SECURITY.md`](SECURITY.md), which is not optional reading.
+- **No identities, scopes, or per-caller audit.** One secret, one privilege level.
+  Holding the token is holding the service account.
 - **No tool-call passthrough.** Tools execute inside Claude Code. A client cannot
   drive or observe them through the OpenAI format.
 - **No conversation state.** Every call passes `--no-session-persistence`.
@@ -29,45 +35,58 @@ self-refreshes from the Anthropic API.
 
 ## 2. Architecture
 
+Symbol names, not line numbers: this file has been edited enough that pinned line
+numbers go stale faster than the gate catches them. Every name below is greppable.
+
 ```mermaid
 flowchart TD
-    C["OpenAI-shaped client<br/>(Hermes provider 'claude-code')"] -->|"POST /v1/chat/completions<br/>127.0.0.1:18782, no auth"| H["handle_chat_completions<br/>server.py:431"]
-    H --> V{"image_url block<br/>in messages?<br/>_has_images :112"}
+    C["OpenAI-shaped client<br/>(Hermes provider 'claude-code')"] -->|"POST /v1/chat/completions<br/>127.0.0.1:18782"| MW["auth_middleware<br/>attached at build_app()"]
 
-    V -->|no| P["messages_to_prompt :184<br/>flatten to one string"]
-    P --> S["semaphore, default 3<br/>sem() :88 · QUEUE_TIMEOUT 90s"]
-    S --> X["_run_claude_json :262<br/>claude --print<br/>--dangerously-skip-permissions<br/>prompt piped on stdin"]
+    MW -->|"GET /health only"| HL["handle_health<br/>UNAUTHENTICATED_PATHS"]
+    MW -->|"no / wrong token"| E401["401 invalid_api_key<br/>subprocess never spawned"]
+    MW -->|"CCAPI_TOKEN unset"| E401
+    MW -->|"hmac.compare_digest OK"| H["handle_chat_completions"]
+
+    H --> V{"image_url block<br/>in messages?<br/>_has_images"}
+
+    V -->|no| P["messages_to_prompt<br/>flatten to one string"]
+    P --> S["semaphore, default 3<br/>sem() · QUEUE_TIMEOUT 90s"]
+    S --> X["_run_claude_json<br/>claude --print<br/>--dangerously-skip-permissions<br/>prompt piped on stdin"]
     X --> CLI["claude CLI subprocess<br/>full Bash/Read/Write tools<br/>runs as the service account"]
 
-    V -->|yes| A["messages_to_anthropic :159"]
-    A --> K["_get_oauth_token :344<br/>reads ~/.claude/.credentials.json"]
-    K --> SDK["_run_claude_sdk :351<br/>AsyncAnthropic(api_key=token)<br/>bypasses the semaphore"]
+    V -->|yes| A["messages_to_anthropic"]
+    A --> K["_get_oauth_token<br/>reads ~/.claude/.credentials.json<br/>access token AND refresh token"]
+    K --> SDK["_run_claude_sdk<br/>bypasses the semaphore"]
     SDK --> API["api.anthropic.com"]
 
-    CLI --> R["OpenAI response<br/>make_completion_response :219<br/>or SSE via _fake_stream_chunks :387"]
+    CLI --> R["OpenAI response<br/>make_completion_response<br/>or SSE via _fake_stream_chunks"]
     SDK --> R
     R --> C
 
-    M["handle_models :415"] -.->|"hourly"| K
-    K -.-> D["_refresh_models :325<br/>merges into VALID_MODELS"]
+    M["handle_models"] -.->|"hourly"| K
+    K -.-> D["_refresh_models<br/>merges into VALID_MODELS"]
 
+    style MW fill:#1f4d7a,color:#fff
     style CLI fill:#7a1f1f,color:#fff
     style K fill:#7a1f1f,color:#fff
 ```
 
 The two red boxes are the whole security story: a request body reaches a subprocess
-with permissions disabled, and a live OAuth token is read off disk on the vision and
-discovery paths.
+with permissions disabled, and a live OAuth token plus a durable refresh token are
+read off disk on the vision and discovery paths. The blue box is the only thing
+standing in front of them. Until 2026-08-16 it did not exist, and the loopback bind
+was the entire access control.
 
 ### Start here
 
 | File | What it is |
 |---|---|
-| `server.py` | **The service.** Everything runs from here. Config constants are at the top (`:35-53`); read those first. |
-| `server.py:431` `handle_chat_completions` | The only interesting handler. The `vision` branch at `:444` is where the two very different execution paths fork. |
-| `server.py:262` `_run_claude_json` | The subprocess call. The argv at `:271-283` is the security posture in eight lines. |
-| `claude-code-api.service` | The systemd **user** unit. Deploy is "copy this and enable it". |
-| `server.js` | **Legacy, not deployed.** The original Node implementation, kept for reference and behind on models and features. Do not assume a fix here reaches production. |
+| `server.py` | **The service.** Everything runs from here. Config constants are at the top, under `Configuration` and `Authentication`; read those first. |
+| `server.py` `auth_middleware` | The gate. Attached in `build_app()` as application middleware, not per route, so a route added later is guarded by default. `UNAUTHENTICATED_PATHS` is the entire exception list. |
+| `server.py` `handle_chat_completions` | The only interesting handler. The `vision` branch is where the two very different execution paths fork. |
+| `server.py` `_run_claude_json` | The subprocess call. Its argv is the security posture in eight lines. |
+| `test_auth.py` | What proves the gate holds, including that it fails when detached. Run by `.github/workflows/ci.yml`. |
+| `claude-code-api.service` | The systemd **user** unit. Deploy is "mint the secret, copy this, enable it". |
 
 ## 3. Build
 
@@ -80,55 +99,130 @@ pip install aiohttp anthropic
 ```
 
 `anthropic` is not optional even if you never send an image: it is imported at module
-scope (`server.py:32`) and used by hourly model discovery.
+scope and used by hourly model discovery.
 
-`server.js` (legacy) would need `npm install` for `express`. Nothing in the deployed
-path uses it.
+There is no Node component. `server.js`, `package.json`, and `package-lock.json` were
+deleted on 2026-08-16.
 
 ## 4. Test
 
-N/A - **there is no automated test suite and no CI that runs the server.**
-`package.json` `scripts.test` is still the `npm init` placeholder
-(`echo "Error: no test specified" && exit 1`). Do not cite CI as a gate for this
-repository: the only workflows are `secret-scan` and `docs-check`, and neither
-executes the server.
+### The automated gate
 
-That is a real gap. Until it is closed, the release gate is manual. Run all four
-after any change to `server.py` and paste the output into the pull request:
+`.github/workflows/ci.yml` runs `python -m unittest discover` on Python 3.11 and 3.12
+on every push and pull request. It is the first workflow in this repository that
+executes the code; `docs-check` reads Markdown and `secret-scan` reads git history.
 
 ```bash
+pip install aiohttp anthropic
+python3 -m unittest discover -v      # 20 tests
+```
+
+`test_auth.py` covers the token gate only: token unset, token blank, no credentials,
+wrong token, a token that is a prefix of the right one, a token with an extra suffix,
+both accepted headers, case-insensitive `Bearer`, the streaming path, and every route
+including the unprefixed aliases. It stubs `_refresh_models` and `_run_claude_json`,
+so it makes no network call, spawns no subprocess, and reads no credentials file.
+
+The CI job also carries a **negative control**: it detaches the middleware from
+`build_app()` and asserts the suite goes red. A gate that has never been observed
+failing is not known to be a gate, and this one is the only thing between a local
+process and arbitrary code execution.
+
+### What is still manual
+
+Everything except auth. The request-translation, streaming, vision, and model
+discovery paths have no automated coverage, because exercising them means calling the
+real `claude` CLI. Run these after any change to `server.py` and paste the output into
+the pull request. Use a scratch port, not 18782, so you do not fight the live unit:
+
+```bash
+export CCAPI_TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+
 # 1. It imports and the routes are wired.
 python3 -c "import server; a = server.build_app(); print(sorted(r.resource.canonical for r in a.router.routes()))"
 
-# 2. It starts and answers.
+# 2. It starts and answers. /health needs no token; /v1/models does.
 python3 server.py --port 18999 &
 curl -sf http://127.0.0.1:18999/health && echo
-curl -sf http://127.0.0.1:18999/v1/models | head -c 200 && echo
+curl -sf http://127.0.0.1:18999/v1/models -H "Authorization: Bearer $CCAPI_TOKEN" | head -c 200 && echo
 
-# 3. A real completion round-trips.
+# 3. Auth is live end to end. Want 401, then 200.
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18999/v1/chat/completions \
+  -H 'Content-Type: application/json' -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}'
+
+# 4. A real completion round-trips.
 curl -s --max-time 300 -X POST http://127.0.0.1:18999/v1/chat/completions \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $CCAPI_TOKEN" -H 'Content-Type: application/json' \
   -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"Reply with exactly: OK"}]}' \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
 
-# 4. Streaming terminates properly.
+# 5. Streaming terminates properly.
 curl -s --max-time 300 -N -X POST http://127.0.0.1:18999/v1/chat/completions \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $CCAPI_TOKEN" -H 'Content-Type: application/json' \
   -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"Count to three."}],"stream":true}' \
   | tail -3   # must end with: data: [DONE]
 
 kill %1
 ```
 
-Use a scratch port, not 18782, so you do not fight the live unit.
-
 ## 5. Release / Deploy
 
 There is no published package and no release artifact. Deploy is "the working tree
 is the deployment": the unit runs `server.py` out of a git checkout.
 
+### One-time cutover to the authenticated build
+
+**Read this before the first `git pull` that brings in the token gate.** The order
+matters: the moment the new `server.py` is running, any consumer that does not send
+the secret gets `401`. On the maintainer's fleet that consumer is Hermes, which today
+sends `Authorization: Bearer no-key-required` because `api_key` in
+`~/.hermes/config.yaml` is `''`.
+
 ```bash
-# Deploy
+# 1. Mint the secret and store it 0600, OUTSIDE the checkout.
+umask 077
+printf 'CCAPI_TOKEN=%s\n' "$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')" \
+  > ~/.config/claude-code-api.env
+chmod 600 ~/.config/claude-code-api.env
+
+# 2. Teach the unit to read it. The repo copy already has the EnvironmentFile line,
+#    so this is the same "copy the unit" step as any other unit change. Review the
+#    ExecStart path before overwriting.
+cd ~/clawd/skcapstone-repos/claude-code-api
+cp claude-code-api.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# 3. Point the consumer at the same secret BEFORE the server starts refusing it.
+#    Hermes: set api_key on the claude-code provider in ~/.hermes/config.yaml to
+#    ${CCAPI_TOKEN}, and put CCAPI_TOKEN=<same value> in ~/.hermes/.env. Hermes hands
+#    api_key to the OpenAI SDK, which sends Authorization: Bearer. Do NOT use a
+#    global default_headers entry: it would send this secret to every other provider.
+
+# 4. Now pull and restart.
+git pull --ff-only
+systemctl --user restart claude-code-api
+
+# 5. Verify, in this order.
+curl -s http://127.0.0.1:18782/health                     # want "auth": "required"
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:18782/v1/models                        # want 401
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $(. ~/.config/claude-code-api.env; echo "$CCAPI_TOKEN")" \
+  http://127.0.0.1:18782/v1/models                        # want 200
+
+# 6. Restart the consumer and confirm it still gets answers.
+systemctl --user restart hermes-gateway     # if that is how it runs
+journalctl --user -u claude-code-api -n 30  # look for 401s from a consumer you forgot
+```
+
+If `/health` reports `"auth": "unconfigured"` after step 4, the unit is not reading the
+env file: check `systemctl --user show claude-code-api -p EnvironmentFiles` and that
+the file exists and is readable. The service is fail-closed in that state, so nothing
+is exposed while you fix it, but nothing works either.
+
+### Ordinary deploy
+
+```bash
 cd ~/clawd/skcapstone-repos/claude-code-api
 git pull --ff-only
 systemctl --user restart claude-code-api
@@ -156,14 +250,16 @@ Restarting drops in-flight requests. There is no graceful drain.
 | Property | Value |
 |---|---|
 | Tier | Internal helper. Not a front-end service. |
-| Bind address | **`127.0.0.1` only.** Default in `server.py:546`; confirmed live with `ss -tlnp` showing `LISTEN 127.0.0.1:18782`. |
+| Bind address | **`127.0.0.1` only.** Default in the `--host` argument; confirmed live with `ss -tlnp` showing `LISTEN 127.0.0.1:18782`. |
 | Port | 18782 |
 | Public `:443` routes | **None.** It is not behind Caddy, Cloudflare, or a tunnel, and it must not be. |
-| Authentication | **None.** The loopback bind is the entire access control. |
-| Consumers | Hermes, via `~/.hermes/config.yaml` provider `claude-code`, `base_url: http://127.0.0.1:18782/v1`, empty `api_key`. |
+| Authentication | **Shared secret**, `CCAPI_TOKEN`, on every route except `GET /health`. Unset means everything 401s. |
+| Consumers | Hermes, via `~/.hermes/config.yaml` provider `claude-code`, `base_url: http://127.0.0.1:18782/v1`. Its `api_key` must carry the secret. |
 
-`--host` exists and will happily bind `0.0.0.0`. Exposing this port is equivalent to
-publishing a remote shell. See [`SECURITY.md`](SECURITY.md).
+`--host` exists and will happily bind `0.0.0.0`. Do not. A shared secret is not a
+reason to publish this port: it still reaches a subprocess running with permissions
+disabled, over cleartext HTTP, with no rate limiting and no per-caller identity. See
+[`SECURITY.md`](SECURITY.md).
 
 ## 6. Configuration / Usage
 
@@ -171,16 +267,18 @@ Configuration is CLI flags plus two environment variables. There is no config fi
 
 | Setting | Kind | Default | Effect |
 |---|---|---|---|
+| `CCAPI_TOKEN` | env | **unset** | **The shared secret.** Required by every route except `GET /health`. Unset or whitespace-only means every authenticated route returns 401. Read per request, so it is never cached past a restart. Store it in `~/.config/claude-code-api.env` at `0600`; never in the unit, never in the repo. |
 | `--port` | flag | 18782 | Listen port. Note `/health` reports the constant, not this. |
 | `--host` | flag | `127.0.0.1` | Bind address. Leave it. |
-| `--debug` | flag | off | Debug logging, including prompt sizes. |
+| `--debug` | flag | off | Debug logging, including prompt sizes. Does not log tokens. |
 | `CCAPI_MAX_CONCURRENT` | env | 3 | Concurrent `claude` subprocesses. Read once, on first use. |
 | `CLAUDE_API_LOAD_MCP` | env | unset | `1`/`true`/`yes` boots the host's MCP servers in every subprocess. Doubles latency and widens the blast radius. A security setting. |
 
-`REQUEST_TIMEOUT` (1800 s) and `QUEUE_TIMEOUT` (90 s) are module constants at
-`server.py:41-42`, not environment variables. Changing them is a code change.
+`REQUEST_TIMEOUT` (1800 s), `QUEUE_TIMEOUT` (90 s), and `HEALTH_ERROR_MAX_CHARS` (200)
+are module constants near the top of `server.py`, not environment variables. Changing
+them is a code change.
 
-### Live deployment on noroc2027 (verified 2026-08-15)
+### Live deployment on noroc2027 (verified 2026-08-16)
 
 - Unit: `~/.config/systemd/user/claude-code-api.service`, `active` and `enabled`.
 - Effective `ExecStart`:
@@ -189,11 +287,15 @@ Configuration is CLI flags plus two environment variables. There is no config fi
   (`RestartSteps=8`, `RestartMaxDelaySec=5min`).
 - Listening: `LISTEN 127.0.0.1:18782`.
 
-**Known drift, needs an operator pass:** the live unit's
-`Documentation=file:///home/cbrd21/clawd/skcapstone-repos/skcapstone/docs/CLAUDE-CODE-API.md`
-points at a file that **does not exist**. The version of `claude-code-api.service` in
-this repository has been corrected to point at this SOP, but copying it over the live
-unit is an operator action and has not been done:
+**Known drift, needs an operator pass.** Both are operator actions that this branch
+cannot perform, and both are covered by the cutover in section 5:
+
+1. **The live service is still the unauthenticated build.** It is running the
+   pre-cutover `server.py` out of the shared checkout. Until step 4 of the cutover, the
+   loopback bind is still the entire access control.
+2. **The live unit has no `EnvironmentFile` and a dead `Documentation=` path**
+   (`file:///home/cbrd21/clawd/skcapstone-repos/skcapstone/docs/CLAUDE-CODE-API.md`
+   does not exist). The repo copy fixes both. Copying it over is manual:
 
 ```bash
 cp claude-code-api.service ~/.config/systemd/user/   # review the ExecStart path first
@@ -202,26 +304,38 @@ systemctl --user daemon-reload && systemctl --user restart claude-code-api
 
 ## 7. API / Reference
 
-Three handlers, each also registered without the `/v1` prefix (`server.py:531-540`).
+Three handlers, the two `/v1` ones also registered without the prefix (see
+`build_app`). All four of those require the token.
 
-| Route | Returns |
-|---|---|
-| `POST /v1/chat/completions` | OpenAI chat completion, or `text/event-stream` SSE ending `data: [DONE]` when `stream: true`. Errors: HTTP 500 `{"error": {...}}`, or a single error frame mid-stream. |
-| `GET /v1/models` | `{"object": "list", "data": [...]}`. Seeded from `VALID_MODELS` (`server.py:44-51`) and refreshed from the Anthropic API at most hourly. |
-| `GET /health` | `{"status": "ok", "service": "claude-code-api", "port": 18782}`. **`port` is the module constant, not `--port`.** |
+| Route | Auth | Returns |
+|---|---|---|
+| `POST /v1/chat/completions` | **token** | OpenAI chat completion, or `text/event-stream` SSE ending `data: [DONE]` when `stream: true`. Errors: HTTP 500 `{"error": {...}}`, or a single error frame mid-stream. |
+| `GET /v1/models` | **token** | `{"object": "list", "data": [...]}`. Seeded from `VALID_MODELS` and refreshed from the Anthropic API at most hourly. |
+| `POST /chat/completions`, `GET /models` | **token** | Unprefixed aliases of the two above, for clients that do not add `/v1`. |
+| `GET /health` | **open** | `{"status", "service", "port", "auth", "model_discovery"}`. **`port` is the module constant, not `--port`.** `auth` is `"required"` or `"unconfigured"` and never contains the secret. |
 
-Model names are normalised by `normalise_model` (`server.py:99`): explicit aliases
-first (`gpt-4` and `opus` map to `claude-opus-4-8`, `gpt-4o` and `sonnet` to
-`claude-sonnet-4-6`, `gpt-4o-mini` / `gpt-3.5-turbo*` / `haiku` to
-`claude-haiku-4-5`), then any `prefix/model` has its prefix stripped. An unknown name
-**logs a warning and silently falls back to `DEFAULT_MODEL`** rather than returning an
-error, so a typo produces an answer from the wrong model. Check the journal if a
-response looks unexpectedly strong or weak.
+Authentication failures return **401** with an OpenAI-shaped body,
+`{"error": {"message": ..., "type": "invalid_request_error", "code": "invalid_api_key"}}`,
+so an OpenAI-compatible client reports an auth problem rather than a generic server
+error. The `message` distinguishes three cases: `CCAPI_TOKEN` unset on the server
+(and names the variable), no credentials presented, and a token mismatch.
+
+Model names are normalised by `normalise_model`: explicit aliases first (`gpt-4` and
+`opus` map to `claude-opus-5`, `gpt-4o` and `sonnet` to `claude-sonnet-5`, `fable` to
+`claude-fable-5`, `gpt-4o-mini` / `gpt-3.5-turbo*` / `haiku` to `claude-haiku-4-5`),
+then any `prefix/model` has its prefix stripped. An unknown name **logs a warning and
+silently falls back to `DEFAULT_MODEL`** rather than returning an error, so a typo
+produces an answer from the wrong model. Check the journal if a response looks
+unexpectedly strong or weak.
 
 ## 8. Troubleshooting
 
 | Symptom | Check |
 |---|---|
+| **Every request 401s, `/health` says `"auth": "unconfigured"`** | The server has no `CCAPI_TOKEN`. This is fail-closed on purpose, not a crash. `systemctl --user show claude-code-api -p EnvironmentFiles` (want `~/.config/claude-code-api.env`), then confirm the file exists, is `0600`, is readable by the service user, and has a non-blank value. `daemon-reload` and restart after fixing. |
+| **Every request 401s, `/health` says `"auth": "required"`** | The server is configured and the **client** is not, or is sending the wrong value. `journalctl --user -u claude-code-api \| grep 401` distinguishes "no credentials presented" from "token mismatch". For Hermes, check `api_key` on the `claude-code` provider in `~/.hermes/config.yaml` and that `${CCAPI_TOKEN}` resolves from `~/.hermes/.env`. |
+| A client that used to work started 401ing after a deploy | The token gate landed. That is this change. Follow the cutover in section 5; the consumer needs the secret. Hermes shipped `api_key: ''`, which the OpenAI SDK sends as `Bearer no-key-required`. |
+| Secret rotated, some caller still broken | There is no dual-token grace window. Every consumer must be updated in the same maintenance window as the env file. Grep the journal for 401s to find the one you forgot. |
 | Connection refused on 18782 | `systemctl --user is-active claude-code-api`; then `ss -tlnp \| grep 18782`. If active but not listening, the port is taken: `journalctl --user -u claude-code-api -n 50`. |
 | Unit flaps or restarts forever | `journalctl --user -u claude-code-api -n 100`. `Restart=always` with no `StartLimitBurst` means a bad `ExecStart` path retries forever instead of failing loudly. Verify the file exists at the effective `ExecStart` path: `systemctl --user show claude-code-api -p ExecStart`. |
 | Every request 500s with `claude exited <n>` | The CLI itself is failing. Reproduce outside the server: `claude --print --model claude-haiku-4-5 <<< hi`. Usually auth: re-authenticate the CLI. |
@@ -229,53 +343,82 @@ response looks unexpectedly strong or weak.
 | A single request pins the box for 30 min | That is `REQUEST_TIMEOUT = 1800`. Working as designed. Kill the subprocess or restart the unit. |
 | Answers come from the wrong model | `normalise_model` fell back to `DEFAULT_MODEL` for an unrecognised name. `journalctl --user -u claude-code-api \| grep "Unknown model"`. |
 | `/health` reports port 18782 but you started it elsewhere | Known wart: the handler returns the module constant. Trust `ss -tlnp`. |
-| `/v1/models` is missing a new model | Discovery is hourly and fails soft. `journalctl --user -u claude-code-api \| grep "Model discovery"`. A failure falls back to the static seed list. |
+| `/v1/models` is missing a new model | Discovery is hourly and fails soft. `journalctl --user -u claude-code-api \| grep "Model discovery"`, or read `model_discovery` on `/health`. A failure falls back to the static seed list. |
 | Requests suddenly 3x slower | Check whether `CLAUDE_API_LOAD_MCP` got set. Booting MCP servers per spawn was the original behaviour and roughly doubles latency. |
 | Vision requests fail while text works | The SDK path, not the CLI path. It reads `~/.claude/.credentials.json`: confirm the file is present, `0600`, and that `claudeAiOauth.accessToken` has not expired. |
-| A change to `server.js` had no effect | `server.js` is not deployed. Nothing runs it. Change `server.py`. |
+| Looking for `server.js` | Deleted 2026-08-16 along with `package.json` and `package-lock.json`. It was never deployed and never had the token gate. `git log -- server.js`. |
 
 ## 9. Maturity tier and version reference
 
 **Maturity: personal / internal helper.** Public repository, single maintainer, no
-test suite, no CI that executes the code, no release process, no published package,
-and no authentication. It is a load-bearing part of one person's fleet, not a product.
-Do not deploy it anywhere you would not deploy an unauthenticated shell.
+release process, no published package, and authentication that is one shared secret
+with no identities. Test coverage exists for the auth gate only. It is a load-bearing
+part of one person's fleet, not a product. Do not deploy it anywhere you would not
+deploy a shell that anyone holding one password can use.
 
-**Version: do not quote a number from this repo; both sources disagree.**
-`package.json` says `1.0.0` and has never been bumped. Git tags run `v1.1.0`,
-`v1.1.1`, `v1.1.2`, `v1.4.0`, `v1.4.1` (with `1.2.x` and `1.3.x` never tagged), and
-the tip is 7 commits past `v1.4.1`. There are no GitHub releases. The git tag is the
-closest thing to a real version; `package.json` is stale. Reconciling them is tracked
-in [`CHANGELOG.md`](CHANGELOG.md#versioning).
+**Version: do not quote a number from this repo.** `package.json` was the other
+claimant and was deleted on 2026-08-16 along with the Node implementation it
+described, so git tags are now the only source. They run `v1.1.0`, `v1.1.1`,
+`v1.1.2`, `v1.4.0`, `v1.4.1` (with `1.2.x` and `1.3.x` never tagged), and the tip is
+well past `v1.4.1`. There are no GitHub releases and no automation derives a version
+from the tag, so a tag records a point in history and nothing more. See
+[`CHANGELOG.md`](CHANGELOG.md#versioning).
 
 **Runtime versions in the verified deployment:** Python from `~/.skenv`, `aiohttp`
 3.13.3, `anthropic` 0.84.0.
 
 ## Unverified / needs an operator pass
 
-- **The live unit's `Documentation=` is a dead path.** Corrected in the repo copy,
-  not yet applied to `~/.config/systemd/user/`. Command in section 6.
-- **`package.json` version drift.** Left alone deliberately; picking a number is a
-  maintainer decision, not a documentation one.
-- **`server.js` is believed dead, not proven dead.** Verified on noroc2027 only: no
-  node process running it, no systemd unit referencing it, and `/opt/claude-code-api`
-  (the path its old unit named) does not exist. If it runs somewhere else, this SOP
-  does not know about it.
+- **The token gate has never run against the live service.** Everything in section 4
+  was verified in tests and against a scratch port. The live unit on noroc2027 was
+  deliberately not restarted by the branch that added this, so the cutover in
+  section 5 is an untested-in-production procedure written from the code, and the
+  Hermes side of it has not been exercised at all.
+- **The live unit is still the unauthenticated build**, and still has the dead
+  `Documentation=` path and no `EnvironmentFile`. Corrected in the repo copy only.
+  Commands in sections 5 and 6.
+- **Consumers other than Hermes are not enumerated.** Hermes is the only one this
+  document has confirmed. Anything else on the box that speaks to `127.0.0.1:18782`
+  will start getting 401s at cutover and nobody has grepped for it. `journalctl` after
+  the restart is the practical way to find out.
+- **Auth is the only tested path.** The request-translation, streaming, vision, and
+  discovery paths still have no automated coverage, so nothing mechanically blocks a
+  broken `server.py` from being deployed as long as its 401s are correct.
 - **No load, latency, or throughput figures are given** because none have been
   measured. The `~6s -> ~3s` figure in commit `818c3a2` is the author's note, not a
   benchmark this document reproduced.
-- **No test suite exists**, so section 4 is a manual checklist. Nothing mechanically
-  blocks a broken `server.py` from being deployed.
 
 <!-- docs-evidence
-verified: 2026-08-15
+verified: 2026-08-16
 checks:
+  - name: the auth middleware is actually attached to the app
+    run: grep -qE '^\s*app = web\.Application\(middlewares=\[auth_middleware\]\)$' server.py
+  - name: documented token env var name matches the server constant
+    run: grep -qx 'CCAPI_TOKEN_ENV = "CCAPI_TOKEN"' server.py
+  - name: documented custom auth header name matches the server constant
+    run: grep -qx 'AUTH_HEADER = "X-CCAPI-Token"' server.py
+  - name: only GET /health is documented and coded as unauthenticated
+    run: grep -qx 'UNAUTHENTICATED_PATHS = frozenset({"/health"})' server.py
+  - name: the token comparison is constant-time, not ==
+    run: grep -qE '^\s*if not hmac\.compare_digest\(presented\.encode\("utf-8"\), expected\.encode\("utf-8"\)\):$' server.py
+  - name: Authorization Bearer is still accepted, as the Hermes cutover depends on it
+    run: grep -qE '^\s*if authz\[:7\]\.lower\(\) == "bearer ":$' server.py
+  - name: an unset token still refuses, so no default-open fallback crept back in
+    run: grep -qE '^\s*expected = expected_token\(\)$' server.py && grep -qE '^\s*if not expected:$' server.py
+  - name: the tracked unit carries no secret and reads one from an env file
+    run: grep -qE '^EnvironmentFile=-%h/\.config/claude-code-api\.env$' claude-code-api.service && ! grep -qE '^Environment=CCAPI_TOKEN' claude-code-api.service
+  - name: the auth test suite exists and CI executes it
+    run: test -f test_auth.py && grep -q 'python -m unittest discover -v' .github/workflows/ci.yml
+  - name: CI still negative-controls the gate by detaching the middleware
+    run: grep -q 'web.Application()' .github/workflows/ci.yml
+  - name: the deleted Node implementation has stayed deleted
+    run: test ! -e server.js && test ! -e package.json
   - name: documented listen port matches the server constant
     run: grep -qx 'PORT = 18782' server.py
   - name: documented default model matches the server constant
-    run: grep -qx 'DEFAULT_MODEL = "claude-opus-4-8"' server.py
-  - name: documented /health payload shape matches the handler
-    run: grep -qE '^\s*return web\.json_response\(\{"status": "ok", "service": "claude-code-api", "port": PORT\}\)' server.py
+    run: grep -qx 'DEFAULT_MODEL = "claude-opus-5"' server.py
+  - name: documented /health auth field matches the handler
+    run: grep -qE '^\s*"auth": "required" if expected_token\(\) else "unconfigured",$' server.py
   - name: documented OAuth credential path matches the constant
     run: grep -qx 'CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")' server.py
   - name: SECURITY.md permission-bypass claim still matches the spawned argv
@@ -286,6 +429,8 @@ checks:
     run: grep -qE '^\s*parser\.add_argument\("--host", default="127\.0\.0\.1"' server.py
   - name: documented request timeout matches the constant
     run: grep -qE '^REQUEST_TIMEOUT = 1800( |$)' server.py
+  - name: documented health error truncation matches the constant
+    run: grep -qE '^HEALTH_ERROR_MAX_CHARS = 200( |$)' server.py
   - name: tracked unit ExecStart matches the documented entry point and port
     run: grep -qE '^ExecStart=.*server\.py --port 18782$' claude-code-api.service
 -->

@@ -7,6 +7,10 @@ can use Claude Code's subscription-covered inference instead of a raw API key.
 
 Architecture:
   - aiohttp HTTP server on port 18782
+  - A shared-secret middleware guards every route except GET /health. See
+    `auth_middleware` below and SECURITY.md. This endpoint spawns
+    `claude --dangerously-skip-permissions`, so an unauthenticated request body
+    is arbitrary code execution; the loopback bind must not be the only control.
   - asyncio.Semaphore(CCAPI_MAX_CONCURRENT, default 3) caps concurrent claude
     invocations so background crons don't block interactive turns
   - All modes: claude --print --output-format json  (reliable, no stream-json timeouts)
@@ -22,6 +26,7 @@ systemd:
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -40,6 +45,37 @@ PORT = 18782
 DEFAULT_MODEL = "claude-opus-5"
 REQUEST_TIMEOUT = 1800  # seconds per claude call (opus can be slow with large context)
 QUEUE_TIMEOUT = 90     # seconds to wait for semaphore before giving up
+
+# ─── Authentication ───────────────────────────────────────────────────────────
+#
+# The shared secret is read from the CCAPI_TOKEN environment variable and
+# compared in constant time. Every route except GET /health requires it.
+#
+# Why a token at all, on a loopback service: `_run_claude_json` spawns
+# `claude --print --dangerously-skip-permissions`, so a request body is arbitrary
+# code execution as the service account, and the vision and discovery paths read
+# a live OAuth access token AND a durable refresh token off disk. Before this
+# existed, every local process on the box, including anything a browser or a
+# compromised dependency could reach, had that authority. A loopback bind is not
+# an authorization decision.
+#
+# Why 401-on-every-request rather than refuse-to-start when CCAPI_TOKEN is unset:
+# the shipped unit is Restart=always with no StartLimitBurst (see
+# claude-code-api.service), so exiting at boot produces a restart loop that never
+# stops and takes /health down with it, leaving an operator with no endpoint to
+# ask what is wrong. Refusing every authenticated request instead is equally
+# fail-closed (nothing reaches the subprocess) but stays diagnosable: /health
+# still answers and the 401 body names the variable to set. What it must never do
+# is default to open when the variable is missing, which is the failure mode this
+# fleet keeps re-learning.
+CCAPI_TOKEN_ENV = "CCAPI_TOKEN"
+AUTH_HEADER = "X-CCAPI-Token"
+# Routes reachable without a token. Keep this to liveness probes only, and keep
+# their responses free of anything an unauthenticated caller should not read.
+UNAUTHENTICATED_PATHS = frozenset({"/health"})
+# /health is unauthenticated, so the discovery error it echoes is bounded rather
+# than emitted raw: it is an arbitrary exception string from the Anthropic SDK.
+HEALTH_ERROR_MAX_CHARS = 200
 
 # SEED list only. `_refresh_models()` discovers the live set from the Anthropic
 # API on boot and hourly, and merges into this set, so new models appear without
@@ -126,6 +162,97 @@ def sem() -> asyncio.Semaphore:
         _sem = asyncio.Semaphore(n)
         log.info("claude subprocess concurrency: %d", n)
     return _sem
+
+
+# ─── Authentication ───────────────────────────────────────────────────────────
+
+def expected_token() -> str:
+    """The configured shared secret, or "" when CCAPI_TOKEN is unset or blank.
+
+    Read per request rather than cached at import so that a test, and an operator
+    who has just corrected the unit environment, sees the current value. A blank
+    or whitespace-only value counts as unset: it must never be treated as a
+    secret that happens to match a blank header.
+    """
+    return os.environ.get(CCAPI_TOKEN_ENV, "").strip()
+
+
+def presented_token(request: web.Request) -> str:
+    """Extract the caller's token from either accepted header.
+
+    Two spellings are accepted:
+      - `Authorization: Bearer <token>`, because OpenAI-compatible clients send
+        their configured api_key this way with no extra configuration.
+      - `X-CCAPI-Token: <token>`, for clients that cannot set Authorization.
+    """
+    header = request.headers.get(AUTH_HEADER, "").strip()
+    if header:
+        return header
+    authz = request.headers.get("Authorization", "").strip()
+    if authz[:7].lower() == "bearer ":
+        return authz[7:].strip()
+    return ""
+
+
+def _unauthorized(message: str) -> web.Response:
+    """A 401 in the OpenAI error shape, so OpenAI-compatible clients surface it."""
+    return web.json_response(
+        {"error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "code": "invalid_api_key",
+        }},
+        status=401,
+    )
+
+
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    """Require the shared secret on every route except UNAUTHENTICATED_PATHS.
+
+    Fail-closed in both directions: an unset CCAPI_TOKEN refuses everything, and
+    a set CCAPI_TOKEN refuses anything that does not match it byte for byte.
+    There is no configuration under which a request without a valid token reaches
+    the subprocess.
+    """
+    if request.path in UNAUTHENTICATED_PATHS:
+        return await handler(request)
+
+    expected = expected_token()
+    if not expected:
+        # Deliberately explicit about the cause. This is a loopback service whose
+        # operator is the only realistic caller, and a silent 401 with no reason
+        # is how a misconfiguration turns into an hour of debugging. An attacker
+        # who can already open this socket learns nothing exploitable from it.
+        log.error(
+            "REFUSING %s %s from %s: %s is unset, so this service is fail-closed. "
+            "Set it in the unit environment and restart.",
+            request.method, request.path, request.remote, CCAPI_TOKEN_ENV,
+        )
+        return _unauthorized(
+            f"claude-code-api is not configured: {CCAPI_TOKEN_ENV} is unset on the "
+            "server, so every authenticated route is refused. Set it in the service "
+            "environment (see SECURITY.md) and restart the unit."
+        )
+
+    presented = presented_token(request)
+    if not presented:
+        log.warning("401 %s %s from %s: no credentials presented",
+                    request.method, request.path, request.remote)
+        return _unauthorized(
+            f"Missing credentials. Send 'Authorization: Bearer <token>' or "
+            f"'{AUTH_HEADER}: <token>'."
+        )
+
+    # compare_digest, not ==, so a wrong token cannot be recovered byte by byte
+    # from response timing. Compared as bytes because compare_digest rejects
+    # non-ASCII str input.
+    if not hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
+        log.warning("401 %s %s from %s: token mismatch",
+                    request.method, request.path, request.remote)
+        return _unauthorized("Invalid token.")
+
+    return await handler(request)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -476,17 +603,22 @@ async def handle_health(request: web.Request) -> web.Response:
     # this, "discovery has been 401ing for days" is indistinguishable from
     # "discovery is working", which is exactly how the list went two
     # generations stale unnoticed.
+    #
+    # This route is UNAUTHENTICATED (see UNAUTHENTICATED_PATHS), so nothing here
+    # may be sensitive. last_error is an arbitrary exception string, so it is
+    # truncated rather than echoed whole; the journal keeps the full text.
     age = (time.time() - _last_model_refresh) if _last_model_refresh else None
     return web.json_response({
         "status": "ok",
         "service": "claude-code-api",
         "port": PORT,
+        "auth": "required" if expected_token() else "unconfigured",
         "model_discovery": {
             "ok": _discovery_ok,
             "last_success_age_seconds": round(age) if age is not None else None,
             "stale": _discovery_ok and age is not None and age > MODEL_REFRESH_INTERVAL * 2,
             "models_served": len(VALID_MODELS),
-            "last_error": _discovery_error,
+            "last_error": _discovery_error[:HEALTH_ERROR_MAX_CHARS] if _discovery_error else None,
         },
     })
 
@@ -608,7 +740,11 @@ async def _on_startup(app: web.Application) -> None:
 
 
 def build_app() -> web.Application:
-    app = web.Application()
+    # auth_middleware is attached at construction, not registered per route, so a
+    # route added later cannot be forgotten. Everything except
+    # UNAUTHENTICATED_PATHS is guarded by default, including the unprefixed
+    # aliases below.
+    app = web.Application(middlewares=[auth_middleware])
     app.on_startup.append(_on_startup)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/v1/models", handle_models)
@@ -635,6 +771,19 @@ def main() -> None:
 
     log.info("Claude Code API starting on %s:%d", args.host, args.port)
     log.info("Supported models: %s", ", ".join(sorted(VALID_MODELS)))
+
+    # Say the auth state out loud at boot. "Unconfigured" is not a fatal error
+    # (see the CCAPI_TOKEN block at the top of this file for why the process
+    # still starts), but it must never be silent: the service is useless in that
+    # state and the operator needs to find out here rather than from a 401 in
+    # some downstream client's log.
+    if expected_token():
+        log.info("Auth: REQUIRED. %s is set; send it as 'Authorization: Bearer <token>' "
+                 "or '%s: <token>'. GET /health stays open.", CCAPI_TOKEN_ENV, AUTH_HEADER)
+    else:
+        log.error("Auth: UNCONFIGURED. %s is unset, so every route except GET /health "
+                  "will return 401. This is fail-closed on purpose. Set %s in the unit "
+                  "environment and restart.", CCAPI_TOKEN_ENV, CCAPI_TOKEN_ENV)
 
     app = build_app()
     web.run_app(app, host=args.host, port=args.port, print=None)

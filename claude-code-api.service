@@ -1,6 +1,15 @@
 # claude-code-api: systemd USER unit.
 #
 # Install with:
+#   # 1. Mint the shared secret FIRST. Without it the service starts but answers
+#   #    401 on every route except /health. That is deliberate (see SECURITY.md);
+#   #    it is not a bug to work around.
+#   umask 077
+#   printf 'CCAPI_TOKEN=%s\n' "$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')" \
+#     > ~/.config/claude-code-api.env
+#   chmod 600 ~/.config/claude-code-api.env
+#
+#   # 2. Then install the unit.
 #   cp claude-code-api.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now claude-code-api.service
@@ -15,7 +24,7 @@
 # cloned somewhere other than ~/clawd/skcapstone-repos/claude-code-api.
 
 [Unit]
-Description=Claude Code API: OpenAI-compatible wrapper for `claude --print` (loopback :18782)
+Description=Claude Code API: OpenAI-compatible wrapper for `claude --print` (loopback :18782, token-gated)
 Documentation=https://github.com/chefboyrdave21/claude-code-api/blob/main/SOP.md
 After=network.target
 
@@ -37,6 +46,19 @@ RestartMaxDelaySec=5min
 
 Environment=HOME=%h
 Environment=TMPDIR=/tmp
+
+# The shared secret every route except GET /health requires. It lives in a
+# 0600 file OUTSIDE the git checkout, never in this tracked unit and never in an
+# Environment= line: `systemctl show` and `systemctl cat` both print Environment=
+# values in the clear to anyone who can read the unit.
+#
+# The leading `-` means "do not fail to start if the file is absent". That is on
+# purpose. A missing file must not turn into a boot loop under Restart=always
+# with no StartLimitBurst; the server handles the unconfigured case itself by
+# refusing every authenticated request with a 401 that names this variable, while
+# keeping /health answering so the state is visible. See the CCAPI_TOKEN block at
+# the top of server.py.
+EnvironmentFile=-%h/.config/claude-code-api.env
 
 # Cap concurrent `claude --print` subprocesses. 3 lets background jobs run
 # without queueing behind a single interactive turn. See server.py `sem()`.
