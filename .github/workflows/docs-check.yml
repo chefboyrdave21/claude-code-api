@@ -1,14 +1,15 @@
 name: docs-check
 
-# Tiers 1 and 2 only, deliberately.
-#
 #   1 = the seven SK_REPO_DOC_STANDARD files exist
 #   2 = a PR that changes code also changes CHANGELOG.md
 #   3 = every check in SOP.md's docs-evidence block still exits 0
 #
-# SOP.md DOES carry a docs-evidence block, and it passes locally today. Tier 3 is
-# still left off so this gate is green on day one; promoting to "1,2,3" is a
-# deliberate follow-up once it has run clean, per DOCS_FRESHNESS_STANDARD.
+# Tier 3 was promoted on 2026-08-16, and it was overdue. While the gate ran at
+# "1,2" the evidence block was written but never EXECUTED, so it silently rotted:
+# PR #3 changed DEFAULT_MODEL and the /health payload, two checks stopped being
+# true, and docs-check stayed green through the whole thing. Reading Markdown is
+# not verifying it. Every check in the block has now been negative-controlled:
+# break the fact, confirm the check goes non-zero, restore.
 #
 # sk-standards is a public repo, so this cross-org reusable-workflow call resolves
 # from chefboyrdave21 without any token or org configuration.
@@ -22,4 +23,4 @@ jobs:
   docs:
     uses: smilinTux/sk-standards/.github/workflows/docs-check.yml@main
     with:
-      tiers: "1,2"
+      tiers: "1,2,3"

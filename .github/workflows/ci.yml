@@ -1,0 +1,93 @@
+name: ci
+
+# The first gate in this repository that actually EXECUTES the code.
+#
+# Before this existed, `docs-check` and `secret-scan` were the only workflows: one
+# read Markdown, the other read git history, and neither imported server.py. A
+# green tick therefore certified that the docs were present and no secret was
+# committed, and nothing else. `package.json` `scripts.test` was still the
+# `npm init` placeholder that exits 1, so there was no test to run either.
+#
+# What this gate is for: server.py is an HTTP endpoint that spawns
+# `claude --dangerously-skip-permissions`, so the shared-secret middleware is the
+# only thing between a local process and arbitrary code execution. An auth check
+# that regresses silently is worse than none, because the deployment keeps
+# looking healthy. test_auth.py negative-tests the gate itself, and this runs it
+# on every push and pull request.
+#
+# Deliberately NOT here: anything that invokes the `claude` CLI, reads
+# ~/.claude/.credentials.json, or reaches api.anthropic.com. The tests stub those
+# collaborators, so this job needs no secret and cannot leak one.
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 matches the deployed interpreter under ~/.skenv (see SOP.md
+        # section 9). 3.11 is the floor README claims, and is here so that claim
+        # stays true rather than being assumed.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install runtime dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # Both are imported at module scope by server.py, so both are needed
+          # just to import it. There is no requirements file to pin against:
+          # this repo has no packaging, by design (see SOP.md section 3).
+          pip install aiohttp anthropic
+
+      - name: Unit tests
+        run: |
+          set -euo pipefail
+          python -m unittest discover -v
+
+      - name: Negative control, the auth gate must be able to FAIL
+        # A gate that has never been observed failing is not known to be a gate.
+        # Detach the middleware and assert the suite goes RED. If auth is ever
+        # reduced to a no-op, this step catches it even if every other test has
+        # been quietly weakened to match.
+        run: |
+          set -euo pipefail
+          cp server.py /tmp/server.py.orig
+          python - <<'PY'
+          import pathlib
+          p = pathlib.Path("server.py")
+          s = p.read_text()
+          new = s.replace("web.Application(middlewares=[auth_middleware])", "web.Application()")
+          assert new != s, "could not detach the middleware: build_app() has changed shape"
+          p.write_text(new)
+          PY
+          if python -m unittest discover >/dev/null 2>&1; then
+            echo "::error::Tests PASSED with the auth middleware removed. The suite is not testing auth."
+            cp /tmp/server.py.orig server.py
+            exit 1
+          fi
+          echo "ok: removing the middleware turns the suite red, as it must"
+          cp /tmp/server.py.orig server.py
+
+      - name: No token value may be committed
+        # Complements secret-scan with a check aimed at this specific change: the
+        # shared secret is supplied by the environment and must never appear in
+        # the tree, including as a "convenient" default in the code.
+        run: |
+          set -euo pipefail
+          if grep -rn --include='*.py' --include='*.md' --include='*.yml' --include='*.service' \
+               -E 'CCAPI_TOKEN[[:space:]]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9+/_-]{8,}' . ; then
+            echo "::error::A CCAPI_TOKEN value looks hardcoded. It must come from the environment only."
+            exit 1
+          fi
+          echo "ok: no hardcoded CCAPI_TOKEN value in the tree"
