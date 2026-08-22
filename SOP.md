@@ -64,7 +64,7 @@ flowchart TD
     R --> C
 
     M["handle_models"] -.->|"hourly"| K
-    K -.-> D["_refresh_models<br/>merges into VALID_MODELS"]
+    K -.-> D["_refresh_models<br/>replaces VALID_MODELS on success<br/>last-good on failure"]
 
     style MW fill:#1f4d7a,color:#fff
     style CLI fill:#7a1f1f,color:#fff
@@ -76,6 +76,20 @@ with permissions disabled, and a live OAuth token plus a durable refresh token a
 read off disk on the vision and discovery paths. The blue box is the only thing
 standing in front of them. Until 2026-08-16 it did not exist, and the loopback bind
 was the entire access control.
+
+### OAuth and model-catalog lifecycle
+
+`~/.claude/.credentials.json` is authoritative. Discovery and multimodal SDK
+requests read its current access token on every call and send it as OAuth Bearer
+authentication. CLI subprocesses explicitly remove an inherited
+`CLAUDE_CODE_OAUTH_TOKEN`; otherwise a token captured by the long-running systemd
+service overrides the freshly updated credential file indefinitely.
+
+A successful, non-empty Anthropic `/v1/models` response replaces `VALID_MODELS`:
+new IDs appear and absent IDs retire. A failed or empty response preserves the
+last-good set. After re-authentication, restart the service to clear any old
+process environment immediately, then require `model_discovery.ok=true` and an
+authenticated completion before declaring the token healthy.
 
 ### Start here
 

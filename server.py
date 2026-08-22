@@ -77,10 +77,10 @@ UNAUTHENTICATED_PATHS = frozenset({"/health"})
 # than emitted raw: it is an arbitrary exception string from the Anthropic SDK.
 HEALTH_ERROR_MAX_CHARS = 200
 
-# SEED list only. `_refresh_models()` discovers the live set from the Anthropic
-# API on boot and hourly, and merges into this set, so new models appear without
-# a code change. The merge is additive only: discovery can never remove a model
-# from here, so an API hiccup cannot shrink what this wrapper will serve.
+# FALLBACK seed only. `_refresh_models()` discovers the authoritative live set
+# from the Anthropic API on boot and hourly. A successful non-empty response
+# replaces the served set, so new models appear and retired models disappear
+# without a code change. A failed/empty response preserves the last-good set.
 #
 # This seed exists so the wrapper is useful before the first refresh completes
 # and if discovery is ever down. Every entry was verified against the installed
@@ -93,7 +93,7 @@ HEALTH_ERROR_MAX_CHARS = 200
 # fell back here, and because a stale list and a fresh one produce an identical
 # /v1/models response, nothing downstream could tell. That is why /health now
 # reports discovery state explicitly.
-VALID_MODELS = {
+SEED_MODELS = frozenset({
     # Claude 5 family (current)
     "claude-opus-5",
     "claude-sonnet-5",
@@ -105,7 +105,8 @@ VALID_MODELS = {
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
     "claude-haiku-4-5-20251001",
-}
+})
+VALID_MODELS = set(SEED_MODELS)
 
 # Interval for the background refresh loop (_refresh_loop), and the TTL the
 # lazy handle_models() path checks. Both, deliberately: the loop is what makes
@@ -458,6 +459,11 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # The Claude CLI owns OAuth refresh and reads its current token
+            # from ~/.claude/.credentials.json. A token exported into the
+            # long-running service environment overrides that file forever,
+            # so explicitly remove it for every child.
+            env={k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"},
         )
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -488,7 +494,7 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
 
 
 async def _refresh_models() -> None:
-    """Discover available models from the Anthropic API and merge into VALID_MODELS.
+    """Replace VALID_MODELS from a successful Anthropic catalog response.
 
     Auth: the token in ~/.claude/.credentials.json is an OAuth access token, and
     an OAuth token must be sent as `Authorization: Bearer`, which the SDK spells
@@ -498,9 +504,9 @@ async def _refresh_models() -> None:
     401 on every attempt since at least 2026-08-15 while the service looked
     healthy, because the failure path just falls back to the static list.
 
-    Merge-only, never subtractive: a discovery result can add models but can
-    never remove one, so a partial or empty response cannot shrink what this
-    wrapper will serve.
+    Successful discovery is authoritative and subtractive: it adds newly
+    available models and removes retired ones. Failures and empty responses
+    preserve the last-good set, so an outage cannot erase the catalog.
     """
     global _last_model_refresh, _discovery_ok, _discovery_error
     try:
@@ -510,12 +516,16 @@ async def _refresh_models() -> None:
         discovered = {m.id for m in page.data if m.id.startswith("claude-")}
         if discovered:
             added = discovered - VALID_MODELS
+            removed = VALID_MODELS - discovered
+            VALID_MODELS.clear()
             VALID_MODELS.update(discovered)
             _last_model_refresh = time.time()
             _discovery_ok = True
             _discovery_error = None
             if added:
                 log.info("Model discovery: +%d new — %s", len(added), ", ".join(sorted(added)))
+            if removed:
+                log.info("Model discovery: -%d retired — %s", len(removed), ", ".join(sorted(removed)))
             log.info("Model discovery complete: %d models", len(VALID_MODELS))
         else:
             # A 200 that lists nothing is not success. Say so rather than
@@ -549,7 +559,7 @@ async def _run_claude_sdk(model: str, system: str, anthropic_msgs: list) -> tupl
     Does NOT consume the CLI semaphore — SDK calls are async and concurrent-safe.
     """
     token = _get_oauth_token()
-    client = anthropic_sdk.AsyncAnthropic(api_key=token)
+    client = anthropic_sdk.AsyncAnthropic(auth_token=token)
 
     kwargs: dict = {
         "model": model,

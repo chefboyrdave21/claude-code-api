@@ -15,6 +15,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Model discovery is now authoritative on success: newly listed Claude models
+  are added and absent/retired models are removed, while failures and empty
+  responses preserve the last-good catalog. Claude CLI children also discard
+  a stale inherited `CLAUDE_CODE_OAUTH_TOKEN` and read the current credential
+  file; the multimodal SDK path now sends OAuth as Bearer authentication.
 - **Model discovery now refreshes on a real interval.** It ran once at startup
   and then only lazily, from `handle_models()`, when a caller happened to request
   `/v1/models` past the TTL. `MODEL_REFRESH_INTERVAL` read like a period and was
