@@ -46,6 +46,9 @@ RestartMaxDelaySec=5min
 
 Environment=HOME=%h
 Environment=TMPDIR=/tmp
+# Never inherit a login-session OAuth snapshot. The CLI and SDK read the
+# rotating credential from ~/.claude/.credentials.json instead.
+UnsetEnvironment=CLAUDE_CODE_OAUTH_TOKEN
 
 # The shared secret every route except GET /health requires. It lives in a
 # 0600 file OUTSIDE the git checkout, never in this tracked unit and never in an

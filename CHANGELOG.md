@@ -15,6 +15,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- The systemd unit now unsets `CLAUDE_CODE_OAUTH_TOKEN`, preventing a stale
+  login-session snapshot from overriding the rotating credentials file in the
+  service process.
 - Model discovery is now authoritative on success: newly listed Claude models
   are added and absent/retired models are removed, while failures and empty
   responses preserve the last-good catalog. Claude CLI children also discard
