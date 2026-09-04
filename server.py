@@ -450,10 +450,31 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
 
     log.debug("Running (non-stream): %s | stdin=%d chars", " ".join(cmd[:6]) + " ...", len(stdin_text))
 
-    async with asyncio.timeout(QUEUE_TIMEOUT):
-        await sem().acquire()
-
+    # The slot MUST be released on every exit path, including one taken between
+    # acquire() returning and the body below starting. Keeping the acquire
+    # outside the try/finally leaked a slot whenever the queue deadline expired
+    # at exactly that moment: `asyncio.timeout.__aexit__` raises TimeoutError
+    # with the slot already held, and nothing ever gave it back. Client
+    # disconnects drive this (Hermes retries a failed call 5x, cancelling the
+    # request task each time), so slots bled away until the semaphore was empty
+    # and EVERY later request sat the full QUEUE_TIMEOUT and failed with a bare
+    # TimeoutError — an empty "Streaming error:" in the log, "provider failed
+    # after retries" in Telegram. Only a restart cleared it. Track the
+    # acquisition and release it from a finally that also covers the acquire.
+    acquired = False
     try:
+        try:
+            async with asyncio.timeout(QUEUE_TIMEOUT):
+                await sem().acquire()
+                acquired = True
+        except TimeoutError:
+            # asyncio.TimeoutError stringifies to "", which is what made the
+            # saturated-queue failure unreadable. Say what actually happened.
+            raise RuntimeError(
+                f"queue timeout: no free claude slot within {QUEUE_TIMEOUT}s "
+                f"(CCAPI_MAX_CONCURRENT={os.environ.get('CCAPI_MAX_CONCURRENT', '3')})"
+            ) from None
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -473,7 +494,8 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
             proc.kill()
             raise RuntimeError(f"claude timed out after {REQUEST_TIMEOUT}s")
     finally:
-        sem().release()
+        if acquired:
+            sem().release()
 
     if proc.returncode != 0:
         err = stderr.decode(errors="replace")[:500]
