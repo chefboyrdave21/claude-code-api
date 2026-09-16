@@ -275,6 +275,19 @@ def normalise_model(model: str) -> str:
     return DEFAULT_MODEL
 
 
+def _requests_tool_calls(body: dict) -> bool:
+    """Return True if the caller expects OpenAI-style function calling.
+
+    `tools: []` is sent freely by OpenAI SDKs and means nothing, and
+    `tool_choice: "none"` explicitly asks for no call — neither is a request
+    this wrapper has to refuse.
+    """
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return False
+    return body.get("tool_choice") != "none"
+
+
 def _has_images(messages: list) -> bool:
     """Return True if any message contains an image_url content block."""
     for msg in messages:
@@ -687,6 +700,30 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
     if not messages:
         raise web.HTTPBadRequest(text="messages array is required")
+
+    # `claude --print` runs its own tool loop and never hands tool_calls back,
+    # so there is no honest way to serve this. Answering anyway returns a
+    # plain finish_reason=stop completion that the caller cannot distinguish
+    # from "the model chose not to call a tool" — which is how a cron job
+    # silently fabricated a calendar sync it never performed (2026-09-15).
+    # Fail loudly instead, and do it before we burn a subprocess slot.
+    if _requests_tool_calls(body):
+        log.warning("400 %s: tools array rejected (model=%s, %d tools)",
+                    request.remote, model, len(body["tools"]))
+        return web.json_response(
+            {"error": {
+                "message": (
+                    "claude-code-api does not support OpenAI-style tool calling: "
+                    "the underlying `claude --print` session runs its own tool loop "
+                    "and cannot return tool_calls. Route tool-using requests to a "
+                    "backend that supports them, or resend without `tools`."
+                ),
+                "type": "invalid_request_error",
+                "param": "tools",
+                "code": "tools_not_supported",
+            }},
+            status=400,
+        )
 
     vision = _has_images(messages)
 
