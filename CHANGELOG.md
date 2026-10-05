@@ -23,6 +23,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   config as of 2026-10-05.
 - Template: `/bloom` and `/work` per-chat model switch, and the context-cache
   entries they depend on.
+- Template: the full curated skgateway model list (30 models that answered a live
+  probe). The 6-model `providers` block shadowed the picker's skgateway row.
 
 ### Changed
 - Every request now runs one isolated CLI turn (`_run_claude_cli`): built-in tools
