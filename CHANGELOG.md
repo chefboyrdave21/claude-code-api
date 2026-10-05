@@ -21,6 +21,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   to diagnose the two failure modes seen on 2026-10-04/05.
 - `examples/hermes-config.yaml`: template of those Hermes keys, matching the live
   config as of 2026-10-05.
+- Template: `/bloom` and `/work` per-chat model switch, and the context-cache
+  entries they depend on.
 
 ### Changed
 - Every request now runs one isolated CLI turn (`_run_claude_cli`): built-in tools
