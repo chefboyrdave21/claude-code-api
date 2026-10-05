@@ -40,47 +40,90 @@ custom_providers:
     api_key: ''            # skgateway authenticates upstream; nothing to put here
     api_mode: chat_completions
     discover_models: true
-    models:
+    models:   # keep in sync with providers below
+      - claude-opus-5
+      - claude-opus-5-5
+      - claude-sonnet-5-5
+      - claude-sonnet-5
+      - claude-fable-5-1
+      - claude-fable-5
+      - claude-opus-4-8
+      - claude-opus-4-7
+      - claude-sonnet-4-6
+      - claude-haiku-4-5-20251001
+      - qwen3.8-27b-huihui-abliterated-q4_k_m
+      - ornith-1.5-9b
+      - moonshotai/kimi-k3
+      - z-ai/glm-5.3
+      - nvidia/nemotron-3-super-120b-a12b
       - sk-auto
       - sk-default
+      - sk-heavy
+      - sk-creative
+      - sk-vision
       - sk-s-public
       - sk-s-internal
       - sk-s-secret
       - sk-m-public
       - sk-m-internal
       - sk-m-secret
-      - sk-l-public
       - sk-l-internal
       - sk-l-secret
       - sk-xl-public
       - sk-xl-internal
-      - sk-xl-secret
-      - sk-vision
-      - sk-creative
-      - sk-heavy
-      - claude-opus-5
-      - claude-sonnet-5
-      - claude-fable-5
-      - claude-opus-4-8
-      - claude-opus-4-7
-      - claude-sonnet-4-6
-      - claude-haiku-4-5-20251001
-      - ornith-1.5-9b
 
-# Required TOGETHER with agent.image_input_mode: native. Without it run_agent
-# decides the model is not vision-capable, strips the image parts and falls back
-# to sk-vision anyway. Per-model on purpose: a main model missing from this list
-# (e.g. a text-only qwen) keeps the fallback instead of receiving images it
-# cannot read.
+# THE skgateway model list for the /model picker, plus per-model capabilities.
+# Hermes treats `providers.custom:skgateway` as the provider row: its model keys
+# REPLACE custom_providers[skgateway].models in the picker. So every pickable
+# model must be listed here, not only the vision ones (2026-10-05: listing just
+# the 6 vision models shrank the picker to 6).
+#
+# Curated to models that answered a live probe on 2026-10-05. skgateway's own
+# /v1/models is not used directly: it still advertises end-of-life names
+# (qwen3.8-27b, qwen3.8-27b-ud-q5_k_xl, qwen38-abliterated; chiap08 now serves
+# only the huihui abliterated qwen3.8, under three aliases) and two buckets no
+# model satisfies (sk-l-public, sk-xl-secret).
+#
+# supports_vision: true is required TOGETHER with agent.image_input_mode: native,
+# otherwise run_agent strips image parts and falls back to sk-vision. Unflagged
+# models keep that describe-then-text fallback.
+#
+# Hermes rewrites config.yaml on /model --global saves and drops comments, so
+# the explanations live here, not in the live file. Edit the live file with a
+# comment-preserving tool (ruamel) or by hand.
 providers:
   custom:skgateway:
     models:
       claude-opus-5: {supports_vision: true}
       claude-opus-5-5: {supports_vision: true}
-      claude-sonnet-5: {supports_vision: true}
       claude-sonnet-5-5: {supports_vision: true}
-      claude-fable-5: {supports_vision: true}
+      claude-sonnet-5: {supports_vision: true}
       claude-fable-5-1: {supports_vision: true}
+      claude-fable-5: {supports_vision: true}
+      claude-opus-4-8: {}
+      claude-opus-4-7: {}
+      claude-sonnet-4-6: {}
+      claude-haiku-4-5-20251001: {}
+      qwen3.8-27b-huihui-abliterated-q4_k_m: {supports_vision: true}
+      ornith-1.5-9b: {}
+      moonshotai/kimi-k3: {}
+      z-ai/glm-5.3: {}
+      nvidia/nemotron-3-super-120b-a12b: {}
+      sk-auto: {}
+      sk-default: {}
+      sk-heavy: {}
+      sk-creative: {}
+      sk-vision: {}
+      sk-s-public: {}
+      sk-s-internal: {}
+      sk-s-secret: {}
+      sk-m-public: {}
+      sk-m-internal: {}
+      sk-m-secret: {}
+      sk-l-internal: {}
+      sk-l-secret: {}
+      sk-xl-public: {}
+      sk-xl-internal: {}
 
 # Per-chat model switch (added 2026-10-05). Claude models will not produce
 # explicit content, so intimate sessions move to the local abliterated model and
