@@ -241,41 +241,13 @@ Any OpenAI-compatible client works. The maintainer's setup consumes it from
 never to `api.anthropic.com`: direct calls with the subscription token are billed as
 third-party usage and fail.
 
-`~/.hermes/config.yaml` is not under version control, so this is its source of truth
-for the parts that touch this service (state as of 2026-10-05):
-
-```yaml
-model:
-  default: claude-opus-5
-  provider: custom:skgateway
-  context_length: 500000
-
-agent:
-  # Send images to the main model as image parts. In `auto`, an explicit
-  # auxiliary.vision backend (sk-vision here) always wins, so images were
-  # described by sk-vision and the main model only ever saw text.
-  image_input_mode: native
-
-custom_providers:
-  - name: skgateway
-    base_url: http://127.0.0.1:18780/v1
-    api_mode: chat_completions
-    # (model list elided)
-
-# Required TOGETHER with image_input_mode: native. Without it run_agent decides the
-# model is not vision-capable, strips the image parts and falls back to sk-vision.
-# Per-model on purpose: a main model not listed here keeps the describe-then-text
-# fallback instead of being sent images it cannot read.
-providers:
-  custom:skgateway:
-    models:
-      claude-opus-5: {supports_vision: true}
-      claude-opus-5-5: {supports_vision: true}
-      claude-sonnet-5: {supports_vision: true}
-      claude-sonnet-5-5: {supports_vision: true}
-      claude-fable-5: {supports_vision: true}
-      claude-fable-5-1: {supports_vision: true}
-```
+`~/.hermes/config.yaml` is not under version control, so
+[`examples/hermes-config.yaml`](examples/hermes-config.yaml) is the source of truth
+for the keys that touch this service: main model via skgateway, the skgateway
+provider, and the two settings native images need (`agent.image_input_mode: native`
+**and** per-model `supports_vision: true` under `providers`; either one alone still
+routes images through sk-vision). Merge those keys into your own config; it is not a
+complete Hermes config.
 
 The `CCAPI_TOKEN` is held by skgateway's `anthropic` backend, not by Hermes.
 

@@ -1,0 +1,83 @@
+# Hermes config template: the parts of ~/.hermes/config.yaml that wire Hermes to
+# claude-code-api. NOT a complete config. Merge these keys into your own
+# ~/.hermes/config.yaml (the live file is not under version control, so this
+# file is its source of truth for these keys).
+#
+# Path: Hermes -> skgateway (:18780, its `anthropic` backend holds CCAPI_TOKEN)
+#       -> claude-code-api (:18782) -> `claude --print`.
+# Never point Hermes at api.anthropic.com with the subscription token: that is
+# billed as third-party usage and fails.
+#
+# Verified 2026-10-05 against Hermes + claude-code-api main (#7, #8):
+#   hermes chat -q "Run 'date' with your terminal tool"     -> real tool call
+#   hermes chat --image red.png -q "what color?"             -> ccapi logs "| images"
+
+model:
+  default: claude-opus-5
+  provider: custom:skgateway
+  context_length: 500000
+
+agent:
+  # Send images to the main model as image parts. In `auto`, an explicit
+  # auxiliary.vision backend (below) always wins, so the main model would only
+  # ever get sk-vision's text description of an image.
+  image_input_mode: native
+
+auxiliary:
+  # Still used: by the vision_analyze tool, and for any main model NOT listed
+  # under `providers` below (it keeps the describe-then-text fallback).
+  vision:
+    provider: skgateway
+    model: sk-vision
+    base_url: http://127.0.0.1:18780/v1
+    api_key: ''
+    timeout: 120
+    download_timeout: 30
+
+custom_providers:
+  - name: skgateway
+    base_url: http://127.0.0.1:18780/v1
+    api_key: ''            # skgateway authenticates upstream; nothing to put here
+    api_mode: chat_completions
+    discover_models: true
+    models:
+      - sk-auto
+      - sk-default
+      - sk-s-public
+      - sk-s-internal
+      - sk-s-secret
+      - sk-m-public
+      - sk-m-internal
+      - sk-m-secret
+      - sk-l-public
+      - sk-l-internal
+      - sk-l-secret
+      - sk-xl-public
+      - sk-xl-internal
+      - sk-xl-secret
+      - sk-vision
+      - sk-creative
+      - sk-heavy
+      - claude-opus-5
+      - claude-sonnet-5
+      - claude-fable-5
+      - claude-opus-4-8
+      - claude-opus-4-7
+      - claude-sonnet-4-6
+      - claude-haiku-4-5-20251001
+      - ornith-1.5-9b
+
+# Required TOGETHER with agent.image_input_mode: native. Without it run_agent
+# decides the model is not vision-capable, strips the image parts and falls back
+# to sk-vision anyway. Per-model on purpose: a main model missing from this list
+# (e.g. a text-only qwen) keeps the fallback instead of receiving images it
+# cannot read.
+providers:
+  custom:skgateway:
+    models:
+      claude-opus-5: {supports_vision: true}
+      claude-opus-5-5: {supports_vision: true}
+      claude-sonnet-5: {supports_vision: true}
+      claude-sonnet-5-5: {supports_vision: true}
+      claude-fable-5: {supports_vision: true}
+      claude-fable-5-1: {supports_vision: true}

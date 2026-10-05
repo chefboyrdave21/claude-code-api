@@ -19,6 +19,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that is no longer how it is wired. It now records the real setup (Hermes ->
   skgateway -> this service), the two Hermes settings native images need, and how
   to diagnose the two failure modes seen on 2026-10-04/05.
+- `examples/hermes-config.yaml`: template of those Hermes keys, matching the live
+  config as of 2026-10-05.
 
 ### Changed
 - Every request now runs one isolated CLI turn (`_run_claude_cli`): built-in tools
