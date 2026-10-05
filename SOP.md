@@ -27,8 +27,9 @@ procedure. It is not optional reading.
 
 - **No identities, scopes, or per-caller audit.** One secret, one privilege level.
   Holding the token is holding the service account.
-- **No tool-call passthrough.** Tools execute inside Claude Code. A client cannot
-  drive or observe them through the OpenAI format.
+- **No execution of caller tools.** A request with `tools` gets them back as
+  OpenAI `tool_calls` via the MCP bridge (`tool_bridge_mcp.py`); the caller runs
+  them. The bridge never executes or answers a call.
 - **No conversation state.** Every call passes `--no-session-persistence`.
 - **No token accounting of its own.** `usage` is whatever the CLI reports, else zero.
 - **No TLS, no proxying, no multi-tenancy, no rate limiting** beyond the semaphore.

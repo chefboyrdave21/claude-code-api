@@ -259,8 +259,13 @@ of which are off-box. `api_key` is scoped to the one provider.
   which is why the loopback bind stays.
 - **Concurrency is capped, not unlimited.** Default 3. Beyond that, requests wait up
   to `QUEUE_TIMEOUT` (90 s) for a slot and then fail.
-- **No `tool_calls` passthrough.** Tools run inside Claude Code and are not surfaced
-  in the OpenAI response format. A client cannot drive tool use through this API.
+- **Caller tools are served through an MCP bridge, statelessly.** A request with
+  `tools` shows those tools to claude as native MCP tools (built-in tools off, the
+  service account's settings and CLAUDE.md not loaded). claude's `tool_use` blocks
+  come back as OpenAI `tool_calls` (parallel calls included, real `toolu_` ids).
+  The next request's tool results are rendered into the prompt as text, so prior
+  tool turns are not native `tool_use` blocks. Images are dropped on this path.
+  Requests WITHOUT `tools` still run the old way, built-in tools and all.
 - **No cross-request memory.** Every call uses `--no-session-persistence`.
 - **Streaming is not token-by-token.** SSE chunks are word-boundary splits of an
   already-complete response, so time-to-first-token equals full generation time.
