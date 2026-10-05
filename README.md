@@ -236,26 +236,38 @@ maintainer's live deployment, including where it currently differs from this fil
 ## Using it from a client
 
 Any OpenAI-compatible client works. The maintainer's setup consumes it from
-**Hermes**, configured in `~/.hermes/config.yaml` as a provider:
+**Hermes** (Lumina's Telegram runtime) through **skgateway** (`:18780`), whose
+`anthropic` backend fronts this service. Hermes never talks to `:18782` directly, and
+never to `api.anthropic.com`: direct calls with the subscription token are billed as
+third-party usage and fail.
 
-```yaml
-  - name: claude-code
-    base_url: http://127.0.0.1:18782/v1
-    api_key: ${CCAPI_TOKEN}      # was '' while the endpoint checked nothing
-    api_mode: chat_completions
-    models:
-      - claude-opus-5
-      - claude-sonnet-5
-      - claude-fable-5
-```
+`~/.hermes/config.yaml` is not under version control, so
+[`examples/hermes-config.yaml`](examples/hermes-config.yaml) is the source of truth
+for the keys that touch this service: main model via skgateway, the skgateway
+provider, and the two settings native images need (`agent.image_input_mode: native`
+**and** per-model `supports_vision: true` under `providers`; either one alone still
+routes images through sk-vision). Merge those keys into your own config; it is not a
+complete Hermes config.
 
-with `CCAPI_TOKEN=<the same secret>` in `~/.hermes/.env`. Hermes hands `api_key` to
-the OpenAI SDK, which sends it as `Authorization: Bearer`, which is exactly what this
-server accepts. That is the whole client-side change.
+The `CCAPI_TOKEN` is held by skgateway's `anthropic` backend, not by Hermes.
 
-**Do not** configure this as a global custom header (Hermes `model.default_headers`).
-That would attach the secret to every OpenAI-compatible provider Hermes talks to, some
-of which are off-box. `api_key` is scoped to the one provider.
+Things that broke before and how to spot them:
+
+- **Every Telegram turn fails with "model provider failed after retries".** From
+  2026-09-17 to 2026-10-04 this service refused any request carrying `tools` with
+  `400 tools_not_supported`, and Hermes sends tools on every turn. Fixed by the MCP
+  bridge (#7). If it recurs, `~/.hermes/logs/errors.log` names the 400.
+- **Images described instead of seen.** Check for `| images` on the `→` line in
+  `journalctl --user -u claude-code-api`. If it is missing and
+  `tools.vision_tools: Analyzing image` appears in `~/.hermes/logs/agent.log`, one of
+  the two settings above is missing.
+- **Switching models with `/model`** saves to `config.yaml` (`--global`). Any claude-*
+  model works through this service now; a model missing from the `providers` block
+  gets images through sk-vision.
+
+To confirm end to end: `hermes chat -q "Run 'date' with your terminal tool"` should
+show a tool call in the session, and `hermes chat --image <png> -q "what color?"`
+should log `| images` here.
 
 ## Known limitations
 
