@@ -81,3 +81,30 @@ providers:
       claude-sonnet-5-5: {supports_vision: true}
       claude-fable-5: {supports_vision: true}
       claude-fable-5-1: {supports_vision: true}
+
+# Per-chat model switch (added 2026-10-05). Claude models will not produce
+# explicit content, so intimate sessions move to the local abliterated model and
+# back. Session-scoped: the global default above is untouched, and /new, /reset
+# or a session auto-reset also return the chat to it. The exec worship/datenight
+# quick commands never touch the model and need neither.
+quick_commands:
+  bloom:
+    type: alias
+    target: /model qwen3.8-27b-huihui-abliterated-q4_k_m --provider custom:skgateway --session
+    description: 🌸 Bloom mode for this chat (abliterated local model, same Lumina)
+  work:
+    type: alias
+    target: /model claude-opus-5 --provider custom:skgateway --session
+    description: 🛠️ Back to Opus for this chat (tools, work, images)
+
+# NOT config.yaml: ~/.hermes/context_length_cache.yaml. A /model switch drops
+# model.context_length and looks the window up again; per-model context_length
+# under custom_providers needs `models` as a dict, which breaks the /model picker
+# (it expects a list). So the windows live in Hermes' context cache instead:
+#
+#   context_lengths:
+#     qwen3.8-27b-huihui-abliterated-q4_k_m@http://127.0.0.1:18780/v1: 131072
+#     claude-opus-5@http://127.0.0.1:18780/v1: 500000
+#
+# Without the first entry a /bloom chat inherits 500k, never compresses in time,
+# and fails at chiap08's 131072-token limit.
