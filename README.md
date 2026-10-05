@@ -6,10 +6,11 @@ Code subscription instead of a metered API key.
 
 > ### ⚠️ This endpoint runs arbitrary commands. Set `CCAPI_TOKEN` before you start it.
 >
-> The server spawns `claude --print --dangerously-skip-permissions`, so Claude Code's
-> Bash, Read, Write, and Edit tools are available with every permission prompt
-> disabled. **The body of an HTTP request is an instruction that can execute code as
-> the user running the server.**
+> Requests run with Claude Code's built-in tools disabled, but `CCAPI_AGENTIC_TEXT=1`
+> brings back `claude --print --dangerously-skip-permissions` for tool-free requests,
+> with Bash, Read, Write, and Edit available and every permission prompt disabled.
+> **Treat the request body as an instruction that can execute code as the user running
+> the server.**
 >
 > Every route except `GET /health` requires a shared secret from the `CCAPI_TOKEN`
 > environment variable. If it is unset, the service starts and refuses everything with
@@ -50,16 +51,19 @@ curl -s http://127.0.0.1:18782/v1/models -H "Authorization: Bearer $CCAPI_TOKEN"
    subprocesses run at once.
 4. Returns an OpenAI-compatible completion object, or chunked SSE if `stream: true`.
 
-**Requests containing images take a different path.** `server.py` detects
-`image_url` content blocks and calls the Anthropic SDK directly rather than the CLI,
-authenticating with the OAuth access token read from `~/.claude/.credentials.json`.
-That path does **not** consume the semaphore.
+**Every request is one isolated CLI turn** (`_run_claude_cli`): `--input-format
+stream-json`, built-in tools off (`--tools ""`), no user/project settings, CLAUDE.md
+or hooks (`--setting-sources ""`), the caller's system prompt in place of Claude
+Code's. Images travel as stream-json image blocks. Caller `tools` are bridged in as
+MCP tools and come back as `tool_calls` (see Known limitations).
 
-> **Why `--output-format json` instead of `stream-json`?**
-> Opus with extended thinking blocks stdout for minutes before emitting any text in
-> stream-json mode, which reads as a timeout. JSON mode runs the full inference and
-> returns one clean payload. Streaming clients still get SSE: the completed text is
-> chunked on word boundaries after the subprocess exits.
+Images used to go to `api.anthropic.com` directly with the OAuth access token. That
+started failing (`429 rate_limit_error`, measured 2026-10-05) once Anthropic began
+billing third-party use of subscription tokens separately, so it was removed.
+
+`CCAPI_AGENTIC_TEXT=1` restores the old behaviour for requests **without** tools:
+`--output-format json`, `--dangerously-skip-permissions`, Claude Code's own tool loop,
+text only. Nothing measured on 2026-10-05 needed it.
 
 ## Prerequisites
 
@@ -92,7 +96,8 @@ python3 server.py --debug         # verbose logging
 | listen port | `--port` | `18782` | |
 | listen host | `--host` | `127.0.0.1` | Leave it. |
 | `CCAPI_MAX_CONCURRENT` | env | `3` | Concurrent `claude` subprocesses. |
-| `CLAUDE_API_LOAD_MCP` | env | unset (off) | `1` boots the host's MCP servers inside every subprocess. Roughly doubles per-request latency and widens the blast radius. This is a security setting. |
+| `CCAPI_AGENTIC_TEXT` | env | unset (off) | `1` makes tool-free requests run Claude Code's own Bash/Read/Write loop under `--dangerously-skip-permissions` again. This is a security setting. |
+| `CLAUDE_API_LOAD_MCP` | env | unset (off) | Only with `CCAPI_AGENTIC_TEXT=1`: boots the host's MCP servers inside every subprocess. Roughly doubles per-request latency and widens the blast radius. This is a security setting. |
 | `REQUEST_TIMEOUT` | constant, `server.py` | `1800` s | Per-call ceiling. Not an env var. |
 | `QUEUE_TIMEOUT` | constant, `server.py` | `90` s | How long a request waits for a semaphore slot before giving up. |
 | `DEFAULT_MODEL` | constant, `server.py` | `claude-opus-5` | Used for an unrecognised model name. |
@@ -264,16 +269,16 @@ of which are off-box. `api_key` is scoped to the one provider.
   service account's settings and CLAUDE.md not loaded). claude's `tool_use` blocks
   come back as OpenAI `tool_calls` (parallel calls included, real `toolu_` ids).
   The next request's tool results are rendered into the prompt as text, so prior
-  tool turns are not native `tool_use` blocks. Images are dropped on this path.
-  Requests WITHOUT `tools` still run the old way, built-in tools and all.
+  tool turns are not native `tool_use` blocks.
 - **No cross-request memory.** Every call uses `--no-session-persistence`.
 - **Streaming is not token-by-token.** SSE chunks are word-boundary splits of an
   already-complete response, so time-to-first-token equals full generation time.
 - **`usage` counts come from the CLI's own report** and are `0` when it does not
   supply them.
-- **Test coverage is auth-only.** `test_auth.py` (run by the `ci` workflow) proves the
-  token gate holds. The request-translation, streaming, vision, and discovery paths
-  still have no automated coverage and are verified by hand, per
+- **Tests stub the CLI.** The `ci` suite covers the token gate, request translation
+  (transcripts, images, tool names), tool_calls responses (stream and not), text-path
+  isolation, the queue slot, discovery, and stream-json parsing against a fake
+  `claude`. A real model round trip is still verified by hand, per
   [`SOP.md`](SOP.md) section 4.
 
 ## Documentation

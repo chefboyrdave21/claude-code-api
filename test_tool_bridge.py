@@ -45,7 +45,7 @@ class ToolRequestRoutingTests(AioHTTPTestCase):
 
     async def test_tool_request_never_reaches_the_text_path(self):
         with mock.patch.object(server, "_run_claude_json") as text_path, \
-             mock.patch.object(server, "_run_claude_tools") as tool_path:
+             mock.patch.object(server, "_run_claude_cli") as tool_path:
             tool_path.return_value = ("", [_CALL], {"output_tokens": 3})
             resp = await self._post({
                 "model": "claude-opus-5",
@@ -57,7 +57,7 @@ class ToolRequestRoutingTests(AioHTTPTestCase):
         tool_path.assert_called_once()
 
     async def test_tool_calls_come_back_in_openai_shape(self):
-        with mock.patch.object(server, "_run_claude_tools") as tool_path:
+        with mock.patch.object(server, "_run_claude_cli") as tool_path:
             tool_path.return_value = ("Checking.", [_CALL], {"output_tokens": 3})
             resp = await self._post({
                 "model": "claude-opus-5",
@@ -70,7 +70,7 @@ class ToolRequestRoutingTests(AioHTTPTestCase):
         self.assertEqual(choice["message"]["content"], "Checking.")
 
     async def test_streaming_tool_calls(self):
-        with mock.patch.object(server, "_run_claude_tools") as tool_path:
+        with mock.patch.object(server, "_run_claude_cli") as tool_path:
             tool_path.return_value = ("", [_CALL], {})
             resp = await self._post({
                 "model": "claude-opus-5",
@@ -89,7 +89,7 @@ class ToolRequestRoutingTests(AioHTTPTestCase):
         self.assertTrue(raw.rstrip().endswith("data: [DONE]"))
 
     async def test_tool_free_answer_finishes_with_stop(self):
-        with mock.patch.object(server, "_run_claude_tools") as tool_path:
+        with mock.patch.object(server, "_run_claude_cli") as tool_path:
             tool_path.return_value = ("It is noon.", [], {})
             resp = await self._post({
                 "model": "claude-opus-5",
@@ -101,7 +101,7 @@ class ToolRequestRoutingTests(AioHTTPTestCase):
         self.assertEqual(choice["message"]["content"], "It is noon.")
 
     async def test_tool_errors_are_loud(self):
-        with mock.patch.object(server, "_run_claude_tools", side_effect=RuntimeError("boom")):
+        with mock.patch.object(server, "_run_claude_cli", side_effect=RuntimeError("boom")):
             resp = await self._post({
                 "model": "claude-opus-5",
                 "messages": [{"role": "user", "content": "hi"}],
@@ -137,21 +137,44 @@ class ToolRequestRoutingTests(AioHTTPTestCase):
 
 class TranscriptTests(unittest.TestCase):
     def test_lone_user_message_passes_through(self):
-        system, prompt = server.messages_to_tool_transcript([
+        system, prompt = server.messages_to_cli_content([
             {"role": "system", "content": "be Lumina"},
             {"role": "user", "content": "hi"},
         ])
-        self.assertEqual((system, prompt), ("be Lumina", "hi"))
+        self.assertEqual((system, prompt), ("be Lumina", [{"type": "text", "text": "hi"}]))
 
     def test_tool_round_trip_is_rendered_with_ids(self):
-        _, prompt = server.messages_to_tool_transcript([
+        _, content = server.messages_to_cli_content([
             {"role": "user", "content": "time?"},
             {"role": "assistant", "content": None, "tool_calls": [_CALL]},
             {"role": "tool", "tool_call_id": "toolu_1", "content": "12:00"},
         ])
+        self.assertEqual(len(content), 1)
+        prompt = content[0]["text"]
         self.assertIn("[called tool get_time id=toolu_1 arguments={}]", prompt)
         self.assertIn('<tool_result id="toolu_1">\n12:00\n</tool_result>', prompt)
         self.assertTrue(prompt.startswith(server.TRANSCRIPT_PREAMBLE))
+
+    def test_lone_user_message_keeps_its_image(self):
+        _, content = server.messages_to_cli_content([{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}])
+        self.assertEqual(content[1], {"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "AAAA"}})
+
+    def test_images_in_a_conversation_are_numbered_and_attached(self):
+        _, content = server.messages_to_cli_content([
+            {"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "https://x/cat.png"}},
+            ]},
+            {"role": "assistant", "content": "A cat."},
+            {"role": "user", "content": "what color?"},
+        ])
+        self.assertIn("[image 1, attached below]", content[0]["text"])
+        self.assertEqual(content[1], {"type": "text", "text": "[image 1]"})
+        self.assertEqual(content[2]["source"], {"type": "url", "url": "https://x/cat.png"})
 
     def test_tool_choice_instructions(self):
         self.assertEqual(server._tool_choice_instruction("auto"), "")
@@ -199,8 +222,32 @@ print(json.dumps({"type": "result", "is_error": False, "result": "It is noon.",
 '''
 
 
+class TextPathIsolationTests(unittest.IsolatedAsyncioTestCase):
+    """Requests without tools must not get Claude Code's own tools or settings."""
+
+    async def _argv(self, env: dict) -> list:
+        server._sem = asyncio.Semaphore(3)
+        spawn = mock.AsyncMock(side_effect=RuntimeError("stop before spawning"))
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(server.asyncio, "create_subprocess_exec", spawn):
+            with self.assertRaises(RuntimeError):
+                await server._run_claude_json("claude-opus-5", "hi", "")
+        return list(spawn.await_args.args)
+
+    async def test_default_text_request_is_isolated(self):
+        argv = await self._argv({"CCAPI_AGENTIC_TEXT": ""})
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
+        self.assertNotIn("--allowedTools", argv)
+
+    async def test_agentic_flag_restores_the_old_path(self):
+        argv = await self._argv({"CCAPI_AGENTIC_TEXT": "1"})
+        self.assertIn("--dangerously-skip-permissions", argv)
+
+
 class RunClaudeToolsTests(unittest.IsolatedAsyncioTestCase):
-    """Drive `_run_claude_tools` against a fake `claude` emitting real stream-json."""
+    """Drive `_run_claude_cli` against a fake `claude` emitting real stream-json."""
 
     def _fake_claude(self, script: str) -> None:
         tmp = tempfile.mkdtemp()
@@ -216,7 +263,7 @@ class RunClaudeToolsTests(unittest.IsolatedAsyncioTestCase):
     async def test_parallel_tool_calls_are_captured_and_claude_is_killed(self):
         self._fake_claude(_FAKE_TOOL_USE)
         started = time.monotonic()
-        text, calls, usage = await server._run_claude_tools(
+        text, calls, usage = await server._run_claude_cli(
             "claude-opus-5", "sys", "weather?", [{"function": {"name": "get_weather"}}])
         self.assertLess(time.monotonic() - started, 20, "did not stop at message_stop")
         self.assertEqual(text, "On it.")
@@ -228,7 +275,7 @@ class RunClaudeToolsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_plain_answer_uses_the_result_event(self):
         self._fake_claude(_FAKE_TEXT)
-        text, calls, usage = await server._run_claude_tools(
+        text, calls, usage = await server._run_claude_cli(
             "claude-opus-5", "", "time?", _TOOLS)
         self.assertEqual((text, calls), ("It is noon.", []))
         self.assertEqual(usage["output_tokens"], 4)

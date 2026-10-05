@@ -116,8 +116,8 @@ sufficient.
   and the `ci` workflow proves the suite goes red when the middleware is detached.
 - **Credential exposure.** `CREDS_PATH` reads `~/.claude/.credentials.json` and
   `_get_oauth_token` extracts `claudeAiOauth.accessToken`, which is passed to the
-  Anthropic SDK by `_refresh_models` (hourly model discovery) and `_run_claude_sdk`
-  (the vision path). Any change that logs that token, echoes it in an error body,
+  Anthropic SDK by `_refresh_models` (hourly model discovery) only; images go
+  through the CLI. Any change that logs that token, echoes it in an error body,
   writes it to disk, or sends it anywhere other than `api.anthropic.com` is a
   vulnerability. Note that the credentials file also holds a **refresh token**, so
   read access to it is durable access, not a short-lived leak.
@@ -170,8 +170,9 @@ sufficient.
 | Listen address | Defaults to `127.0.0.1`. **Do not change this.** |
 | Authentication | **Required.** Shared secret in `CCAPI_TOKEN`, `hmac.compare_digest`, every route except `GET /health`. Unset means everything 401s. |
 | Transport encryption | None. Loopback only, so none is needed. TLS is not a substitute for the token, and the token is not a substitute for the loopback bind. |
-| Tool permission prompts | **Disabled** via `--dangerously-skip-permissions`. |
-| MCP servers in the subprocess | **Disabled by default** (`--strict-mcp-config --mcp-config '{"mcpServers":{}}'`). Setting `CLAUDE_API_LOAD_MCP=1` re-enables the host's configured MCP servers inside the wrapper, which **widens the blast radius** from local tools to every tool those servers expose. Treat that env var as a security setting. |
+| Built-in tools | **Off** (`--tools ""`) for every request, with no service-account settings, CLAUDE.md or hooks (`--setting-sources ""`). Caller tools are only ever returned as `tool_calls`; `tool_bridge_mcp.py` never executes one. |
+| Tool permission prompts | Only with `CCAPI_AGENTIC_TEXT=1`: **disabled** via `--dangerously-skip-permissions` for tool-free requests. |
+| MCP servers in the subprocess | Only with `CCAPI_AGENTIC_TEXT=1`; **disabled by default** even then (`--strict-mcp-config --mcp-config '{"mcpServers":{}}'`). Setting `CLAUDE_API_LOAD_MCP=1` re-enables the host's configured MCP servers inside the wrapper, which **widens the blast radius** from local tools to every tool those servers expose. Treat that env var as a security setting. |
 | Session persistence | Disabled via `--no-session-persistence`, so a prompt cannot poison a later request through saved session state. |
 | Credential file permissions | `~/.claude/.credentials.json` and `~/.config/claude-code-api.env` are both expected to be `0600`. The server creates or chmods neither. |
 | Secrets in the tree | `secret-scan` walks the full history with the gitleaks binary; `ci` additionally greps for a hardcoded `CCAPI_TOKEN` value. |

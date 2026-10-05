@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Authoritative model discovery and OAuth child-environment tests."""
 
+import asyncio
 import os
 import unittest
 from types import SimpleNamespace
@@ -55,15 +56,14 @@ class ModelDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server.VALID_MODELS, {"claude-last-good"})
 
     async def test_cli_child_drops_stale_oauth_environment_override(self):
-        proc = SimpleNamespace(returncode=0, communicate=mock.AsyncMock(
-            return_value=(b'{"result":"ok","usage":{}}', b"")))
+        server._sem = asyncio.Semaphore(3)
+        spawn = mock.AsyncMock(side_effect=RuntimeError("stop before spawning"))
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "stale"}), \
-             mock.patch.object(server.asyncio, "create_subprocess_exec",
-                               mock.AsyncMock(return_value=proc)) as spawn:
-            await server._run_claude_json("claude-test", "hi", "")
+             mock.patch.object(server.asyncio, "create_subprocess_exec", spawn):
+            with self.assertRaises(RuntimeError):
+                await server._run_claude_json("claude-test", "hi", "")
 
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", spawn.await_args.kwargs["env"])
-
 
 if __name__ == "__main__":
     unittest.main()
