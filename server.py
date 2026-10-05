@@ -26,10 +26,16 @@ systemd:
 
 import argparse
 import asyncio
+import contextlib
+import hashlib
 import hmac
 import json
 import logging
 import os
+import re
+import signal
+import sys
+import tempfile
 import time
 import uuid
 from typing import AsyncIterator
@@ -420,6 +426,39 @@ def make_completion_response(
     }
 
 
+def make_tool_calls_response(
+    model: str,
+    content: str,
+    tool_calls: list,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+) -> dict:
+    """A chat completion that hands tool calls back to the caller."""
+    resp = make_completion_response(model, content, prompt_tokens, completion_tokens)
+    choice = resp["choices"][0]
+    choice["message"] = {"role": "assistant", "content": content or None, "tool_calls": tool_calls}
+    choice["finish_reason"] = "tool_calls"
+    return resp
+
+
+def make_tool_calls_sse_chunks(model: str, tool_calls: list) -> list[str]:
+    """SSE chunks for tool calls: one delta per call, then finish_reason=tool_calls."""
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+    def chunk(delta: dict, finish: str | None) -> str:
+        return "data: " + json.dumps({
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }) + "\n\n"
+
+    out = [chunk({"tool_calls": [dict(call, index=i)]}, None) for i, call in enumerate(tool_calls)]
+    out.append(chunk({}, "tool_calls"))
+    return out
+
+
 def make_sse_chunk(model: str, delta: str, finish: bool = False) -> str:
     """Format a single SSE data line for streaming chat completions."""
     obj = {
@@ -437,6 +476,50 @@ def make_sse_chunk(model: str, delta: str, finish: bool = False) -> str:
 
 
 # ─── Claude subprocess helpers ────────────────────────────────────────────────
+
+def _child_env() -> dict:
+    """Environment for every claude child.
+
+    The Claude CLI owns OAuth refresh and reads its current token from
+    ~/.claude/.credentials.json. A token exported into the long-running service
+    environment overrides that file forever, so explicitly remove it.
+    """
+    return {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"}
+
+
+@contextlib.asynccontextmanager
+async def _claude_slot():
+    """Hold one concurrency slot for the duration of a claude subprocess.
+
+    The slot MUST be released on every exit path, including one taken between
+    acquire() returning and the body below starting. Keeping the acquire
+    outside the try/finally leaked a slot whenever the queue deadline expired
+    at exactly that moment: `asyncio.timeout.__aexit__` raises TimeoutError
+    with the slot already held, and nothing ever gave it back. Client
+    disconnects drive this (Hermes retries a failed call 5x, cancelling the
+    request task each time), so slots bled away until the semaphore was empty
+    and EVERY later request sat the full QUEUE_TIMEOUT and failed with a bare
+    TimeoutError — an empty "Streaming error:" in the log, "provider failed
+    after retries" in Telegram. Only a restart cleared it. Track the
+    acquisition and release it from a finally that also covers the acquire.
+    """
+    acquired = False
+    try:
+        try:
+            async with asyncio.timeout(QUEUE_TIMEOUT):
+                await sem().acquire()
+                acquired = True
+        except TimeoutError:
+            # asyncio.TimeoutError stringifies to "", which is what made the
+            # saturated-queue failure unreadable. Say what actually happened.
+            raise RuntimeError(
+                f"queue timeout: no free claude slot within {QUEUE_TIMEOUT}s "
+                f"(CCAPI_MAX_CONCURRENT={os.environ.get('CCAPI_MAX_CONCURRENT', '3')})"
+            ) from None
+        yield
+    finally:
+        if acquired:
+            sem().release()
 
 async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, dict]:
     """
@@ -463,41 +546,13 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
 
     log.debug("Running (non-stream): %s | stdin=%d chars", " ".join(cmd[:6]) + " ...", len(stdin_text))
 
-    # The slot MUST be released on every exit path, including one taken between
-    # acquire() returning and the body below starting. Keeping the acquire
-    # outside the try/finally leaked a slot whenever the queue deadline expired
-    # at exactly that moment: `asyncio.timeout.__aexit__` raises TimeoutError
-    # with the slot already held, and nothing ever gave it back. Client
-    # disconnects drive this (Hermes retries a failed call 5x, cancelling the
-    # request task each time), so slots bled away until the semaphore was empty
-    # and EVERY later request sat the full QUEUE_TIMEOUT and failed with a bare
-    # TimeoutError — an empty "Streaming error:" in the log, "provider failed
-    # after retries" in Telegram. Only a restart cleared it. Track the
-    # acquisition and release it from a finally that also covers the acquire.
-    acquired = False
-    try:
-        try:
-            async with asyncio.timeout(QUEUE_TIMEOUT):
-                await sem().acquire()
-                acquired = True
-        except TimeoutError:
-            # asyncio.TimeoutError stringifies to "", which is what made the
-            # saturated-queue failure unreadable. Say what actually happened.
-            raise RuntimeError(
-                f"queue timeout: no free claude slot within {QUEUE_TIMEOUT}s "
-                f"(CCAPI_MAX_CONCURRENT={os.environ.get('CCAPI_MAX_CONCURRENT', '3')})"
-            ) from None
-
+    async with _claude_slot():
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            # The Claude CLI owns OAuth refresh and reads its current token
-            # from ~/.claude/.credentials.json. A token exported into the
-            # long-running service environment overrides that file forever,
-            # so explicitly remove it for every child.
-            env={k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"},
+            env=_child_env(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -506,9 +561,6 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
         except asyncio.TimeoutError:
             proc.kill()
             raise RuntimeError(f"claude timed out after {REQUEST_TIMEOUT}s")
-    finally:
-        if acquired:
-            sem().release()
 
     if proc.returncode != 0:
         err = stderr.decode(errors="replace")[:500]
@@ -526,6 +578,267 @@ async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, d
     text = result.get("result", "")
     usage = result.get("usage", {})
     return text, usage
+
+
+# ─── Caller tools: native tool_use through an MCP bridge ─────────────────────
+#
+# `claude --print` runs its own tool loop and never hands tool_calls back. So the
+# caller's tools are shown to claude as a real MCP server (tool_bridge_mcp.py),
+# with every built-in tool disabled. When claude calls one, we read the tool_use
+# blocks off the stream-json output, wait for the message to close (so parallel
+# calls are all captured), kill the process group, and return them as OpenAI
+# `tool_calls`. The bridge never executes or answers anything.
+#
+# Stateless by design: the next request carries the tool results inside its
+# message history, which is rendered into the prompt. That survives restarts,
+# client retries and client-side history compression, and needs no session
+# store. Measured 2026-10-05 against Hermes' real 30-tool set: 3-5s per call,
+# parallel calls captured, prompt cache hit on the repeated prefix.
+#
+# Isolation matters as much as the bridge. Without --setting-sources "" and a
+# replaced system prompt, every request inherited the service account's
+# CLAUDE.md, SessionStart hooks and the full Claude Code system prompt
+# (~13k tokens per call, and the model greeted the operator by name).
+
+BRIDGE_SERVER = "caller"
+BRIDGE_PREFIX = f"mcp__{BRIDGE_SERVER}__"
+BRIDGE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tool_bridge_mcp.py")
+# Anthropic tool names: ^[a-zA-Z0-9_-]{1,64}$, and the MCP prefix counts.
+_TOOL_NAME_MAX = 64 - len(BRIDGE_PREFIX)
+_TOOL_NAME_BAD = re.compile(r"[^a-zA-Z0-9_-]")
+# stream-json lines carry whole messages (and the init event lists every tool),
+# far past asyncio's 64 KiB default line limit.
+_STREAM_LINE_LIMIT = 64 * 1024 * 1024
+
+TRANSCRIPT_PREAMBLE = (
+    "The conversation so far is below, oldest first. Continue it as the assistant: "
+    "respond to the latest message. To use a tool, call it through your tool "
+    "interface. Never write tool calls or tool results as text, and never invent "
+    "a tool result."
+)
+
+
+def _exposed_tool_names(tools: list) -> dict[str, str]:
+    """Map the name claude sees -> the caller's original function name.
+
+    Names that are too long or carry characters the API refuses are rewritten
+    to a stable, unique form so the request does not fail outright.
+    """
+    mapping: dict[str, str] = {}
+    for tool in tools:
+        name = (tool.get("function") or {}).get("name") or ""
+        exposed = name
+        if len(name) > _TOOL_NAME_MAX or _TOOL_NAME_BAD.search(name) or not name:
+            digest = hashlib.sha256(name.encode()).hexdigest()[:8]
+            exposed = f"{_TOOL_NAME_BAD.sub('_', name)[:_TOOL_NAME_MAX - 9]}_{digest}"
+        mapping[exposed] = name
+    return mapping
+
+
+def _bridge_tool_specs(tools: list, names: dict[str, str]) -> list[dict]:
+    """OpenAI tool definitions -> MCP tools/list entries, in exposed-name space."""
+    by_original = {orig: exposed for exposed, orig in names.items()}
+    specs = []
+    for tool in tools:
+        fn = tool.get("function") or {}
+        schema = fn.get("parameters") or {}
+        if schema.get("type") != "object":
+            schema = {"type": "object", "properties": {}}
+        specs.append({
+            "name": by_original[fn.get("name") or ""],
+            "description": fn.get("description") or "",
+            "inputSchema": schema,
+        })
+    return specs
+
+
+def _tool_choice_instruction(tool_choice) -> str:
+    """OpenAI tool_choice -> a system prompt line. "auto"/absent needs none."""
+    if tool_choice == "required":
+        return "You must call at least one tool in this response."
+    if isinstance(tool_choice, dict):
+        name = (tool_choice.get("function") or {}).get("name")
+        if name:
+            return f"You must call the tool `{name}` in this response."
+    return ""
+
+
+def _text_of(content) -> str:
+    if isinstance(content, list):
+        return "\n".join(
+            c.get("text", "") for c in content
+            if isinstance(c, dict) and c.get("type") == "text"
+        )
+    return content or ""
+
+
+def messages_to_tool_transcript(messages: list) -> tuple[str, str]:
+    """Render OpenAI messages, including tool_calls and tool results, for claude.
+
+    Returns (system_prompt, stdin_prompt). A lone user message is passed through
+    untouched. Images are dropped on this path (text only).
+    """
+    system_parts: list[str] = []
+    turns: list[dict] = []
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_parts.append(_text_of(msg.get("content")))
+        else:
+            turns.append(msg)
+    system = "\n\n".join(p for p in system_parts if p)
+
+    if len(turns) == 1 and turns[0].get("role") == "user":
+        return system, _text_of(turns[0].get("content"))
+
+    blocks = [TRANSCRIPT_PREAMBLE, ""]
+    for msg in turns:
+        role = msg.get("role")
+        text = _text_of(msg.get("content"))
+        if role == "user":
+            blocks.append(f"<user>\n{text}\n</user>")
+        elif role == "assistant":
+            parts = [text] if text else []
+            for call in msg.get("tool_calls") or []:
+                fn = call.get("function") or {}
+                parts.append(
+                    f'[called tool {fn.get("name")} id={call.get("id")} '
+                    f'arguments={fn.get("arguments") or "{}"}]'
+                )
+            blocks.append("<assistant>\n" + "\n".join(parts) + "\n</assistant>")
+        elif role == "tool":
+            blocks.append(
+                f'<tool_result id="{msg.get("tool_call_id", "")}">\n{text}\n</tool_result>'
+            )
+    return system, "\n\n".join(blocks)
+
+
+def _kill_group(proc) -> None:
+    """Kill claude and the bridge it spawned (they share a process group)."""
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+
+
+async def _run_claude_tools(
+    model: str, system: str, prompt: str, tools: list, tool_choice=None,
+) -> tuple[str, list[dict], dict]:
+    """Run claude with the caller's tools bridged in.
+
+    Returns (text, tool_calls, usage). tool_calls are OpenAI-shaped and carry
+    claude's own toolu_ ids, so the caller's tool_call_id round-trips cleanly.
+    """
+    names = _exposed_tool_names(tools)
+    instruction = _tool_choice_instruction(tool_choice)
+    if instruction:
+        system = f"{system}\n\n{instruction}" if system else instruction
+
+    with tempfile.TemporaryDirectory(prefix="ccapi-tools-") as tmp:
+        tools_path = os.path.join(tmp, "tools.json")
+        with open(tools_path, "w") as f:
+            json.dump(_bridge_tool_specs(tools, names), f)
+        # A file, not an argument: Hermes' system prompt alone can pass the
+        # kernel's 128 KiB single-argument limit.
+        system_path = os.path.join(tmp, "system.txt")
+        with open(system_path, "w") as f:
+            f.write(system or "You are a helpful assistant.")
+        mcp_config = {"mcpServers": {BRIDGE_SERVER: {
+            "command": sys.executable, "args": [BRIDGE_SCRIPT, tools_path],
+        }}}
+        cmd = [
+            "claude", "--print",
+            "--model", model,
+            "--output-format", "stream-json", "--verbose",
+            "--include-partial-messages",
+            "--no-session-persistence",
+            "--setting-sources", "",
+            "--system-prompt-file", system_path,
+            "--tools", "",
+            "--strict-mcp-config", "--mcp-config", json.dumps(mcp_config),
+            "--allowedTools", ",".join(BRIDGE_PREFIX + n for n in names),
+        ]
+        log.debug("Running (tools): %d tools | stdin=%d chars", len(names), len(prompt))
+
+        text_parts: list[str] = []
+        calls: list[dict] = []
+        usage: dict = {}
+        result_text: str | None = None
+        async with _claude_slot():
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_child_env(),
+                cwd=tmp,
+                start_new_session=True,
+                limit=_STREAM_LINE_LIMIT,
+            )
+            # Drained concurrently: a full stderr pipe would stall claude
+            # while we wait on stdout.
+            stderr_task = asyncio.create_task(proc.stderr.read())
+            try:
+                proc.stdin.write(prompt.encode())
+                await proc.stdin.drain()
+                proc.stdin.close()
+                async with asyncio.timeout(REQUEST_TIMEOUT):
+                    async for raw in proc.stdout:
+                        try:
+                            ev = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        kind = ev.get("type")
+                        if kind == "assistant":
+                            for block in ev.get("message", {}).get("content", []):
+                                if block.get("type") == "text" and block.get("text"):
+                                    text_parts.append(block["text"])
+                                elif block.get("type") == "tool_use":
+                                    name = block.get("name", "")
+                                    if not name.startswith(BRIDGE_PREFIX):
+                                        continue  # built-ins are disabled; ignore anything else
+                                    exposed = name[len(BRIDGE_PREFIX):]
+                                    calls.append({
+                                        "id": block["id"],
+                                        "type": "function",
+                                        "function": {
+                                            "name": names.get(exposed, exposed),
+                                            "arguments": json.dumps(block.get("input") or {}),
+                                        },
+                                    })
+                        elif kind == "stream_event":
+                            event = ev.get("event", {})
+                            etype = event.get("type")
+                            if etype == "message_start":
+                                usage.update(event.get("message", {}).get("usage") or {})
+                            elif etype == "message_delta":
+                                usage.update(event.get("usage") or {})
+                            elif etype == "message_stop" and calls:
+                                # Every tool_use of this message is in. Stop
+                                # before claude waits on a bridge that never answers.
+                                break
+                        elif kind == "result":
+                            if ev.get("is_error"):
+                                raise RuntimeError(ev.get("result") or "Claude returned an error")
+                            result_text = ev.get("result")
+                            usage.update(ev.get("usage") or {})
+                            break
+            except TimeoutError:
+                raise RuntimeError(f"claude timed out after {REQUEST_TIMEOUT}s") from None
+            finally:
+                _kill_group(proc)
+                await proc.wait()
+                if calls or result_text is not None:
+                    stderr_task.cancel()
+
+        if not calls and result_text is None:
+            err = (await stderr_task).decode(errors="replace")[:500]
+            raise RuntimeError(f"claude exited {proc.returncode} without a result: {err}")
+
+    text = result_text if (result_text is not None and not calls) else "\n\n".join(text_parts)
+    return text, calls, usage
 
 
 async def _refresh_models() -> None:
@@ -688,6 +1001,66 @@ async def handle_models(request: web.Request) -> web.Response:
     return web.json_response({"object": "list", "data": models})
 
 
+async def _handle_tool_completion(
+    request: web.Request, body: dict, model: str, messages: list, streaming: bool,
+) -> web.StreamResponse:
+    """Serve a request that carries `tools`, via the MCP bridge."""
+    tools = body["tools"]
+    system, prompt = messages_to_tool_transcript(messages)
+    log.info("→ %s | stream=%s | model=%s | tools=%d | %d chars",
+             request.remote, streaming, model, len(tools), len(prompt))
+    try:
+        text, calls, usage = await _run_claude_tools(
+            model, system, prompt, tools, body.get("tool_choice"),
+        )
+    except Exception as exc:
+        log.error("Tool request error: %s", exc)
+        return web.json_response({"error": {"message": str(exc), "type": "server_error"}}, status=500)
+
+    log.info("← %s | model=%s | %d tool calls%s | %d output chars", request.remote, model,
+             len(calls), f" ({', '.join(c['function']['name'] for c in calls)})" if calls else "",
+             len(text))
+    prompt_tokens = (usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+                     + usage.get("cache_creation_input_tokens", 0))
+    completion_tokens = usage.get("output_tokens", 0)
+
+    if not streaming:
+        if calls:
+            return web.json_response(make_tool_calls_response(
+                model, text, calls, prompt_tokens, completion_tokens))
+        return web.json_response(make_completion_response(
+            model, text, prompt_tokens, completion_tokens))
+
+    response = web.StreamResponse(headers={
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+    await response.prepare(request)
+    try:
+        role_chunk = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+        async for delta in _fake_stream_chunks(text):
+            if delta:
+                await response.write(make_sse_chunk(model, delta).encode())
+        if calls:
+            for c in make_tool_calls_sse_chunks(model, calls):
+                await response.write(c.encode())
+        else:
+            await response.write(make_sse_chunk(model, "", finish=True).encode())
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+    except Exception:
+        pass  # client already disconnected
+    return response
+
+
 async def handle_chat_completions(request: web.Request) -> web.Response:
     try:
         body = await request.json()
@@ -701,29 +1074,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     if not messages:
         raise web.HTTPBadRequest(text="messages array is required")
 
-    # `claude --print` runs its own tool loop and never hands tool_calls back,
-    # so there is no honest way to serve this. Answering anyway returns a
-    # plain finish_reason=stop completion that the caller cannot distinguish
-    # from "the model chose not to call a tool" — which is how a cron job
-    # silently fabricated a calendar sync it never performed (2026-09-15).
-    # Fail loudly instead, and do it before we burn a subprocess slot.
     if _requests_tool_calls(body):
-        log.warning("400 %s: tools array rejected (model=%s, %d tools)",
-                    request.remote, model, len(body["tools"]))
-        return web.json_response(
-            {"error": {
-                "message": (
-                    "claude-code-api does not support OpenAI-style tool calling: "
-                    "the underlying `claude --print` session runs its own tool loop "
-                    "and cannot return tool_calls. Route tool-using requests to a "
-                    "backend that supports them, or resend without `tools`."
-                ),
-                "type": "invalid_request_error",
-                "param": "tools",
-                "code": "tools_not_supported",
-            }},
-            status=400,
-        )
+        return await _handle_tool_completion(request, body, model, messages, streaming)
 
     vision = _has_images(messages)
 

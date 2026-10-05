@@ -14,6 +14,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- OpenAI tool calling. Requests carrying `tools` are no longer refused with
+  `400 tools_not_supported`: the caller's tools are exposed to claude through a
+  stdio MCP bridge (`tool_bridge_mcp.py`), its `tool_use` blocks are read off
+  `--output-format stream-json`, the process group is killed at `message_stop`,
+  and the calls return as `tool_calls` with `finish_reason: tool_calls`
+  (streaming and non-streaming, parallel calls supported). The tool path runs
+  with built-in tools disabled, `--setting-sources ""` and a replaced system
+  prompt, so callers no longer inherit the service account's CLAUDE.md and hooks
+  (~13k tokens per call before). Stateless: tool results arrive in the next
+  request's history.
+
 ### Fixed
 - The systemd unit now unsets `CLAUDE_CODE_OAUTH_TOKEN`, preventing a stale
   login-session snapshot from overriding the rotating credentials file in the
