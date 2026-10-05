@@ -48,27 +48,22 @@ flowchart TD
     MW -->|"CCAPI_TOKEN unset"| E401
     MW -->|"hmac.compare_digest OK"| H["handle_chat_completions"]
 
-    H --> V{"image_url block<br/>in messages?<br/>_has_images"}
-
-    V -->|no| P["messages_to_prompt<br/>flatten to one string"]
-    P --> S["semaphore, default 3<br/>sem() · QUEUE_TIMEOUT 90s"]
-    S --> X["_run_claude_json<br/>claude --print<br/>--dangerously-skip-permissions<br/>prompt piped on stdin"]
-    X --> CLI["claude CLI subprocess<br/>full Bash/Read/Write tools<br/>runs as the service account"]
-
-    V -->|yes| A["messages_to_anthropic"]
-    A --> K["_get_oauth_token<br/>reads ~/.claude/.credentials.json<br/>access token AND refresh token"]
-    K --> SDK["_run_claude_sdk<br/>bypasses the semaphore"]
-    SDK --> API["api.anthropic.com"]
-
-    CLI --> R["OpenAI response<br/>make_completion_response<br/>or SSE via _fake_stream_chunks"]
-    SDK --> R
+    H --> P["messages_to_cli_content<br/>text transcript + image blocks"]
+    P --> S["_claude_slot<br/>semaphore, default 3 · QUEUE_TIMEOUT 90s"]
+    S --> CLI["_run_claude_cli<br/>claude --print, stream-json in/out<br/>--tools '' · --setting-sources ''"]
+    CLI -->|"request had tools"| B["tool_bridge_mcp.py<br/>caller tools as MCP tools<br/>never executes"]
+    B -->|"tool_use read off stdout,<br/>group killed at message_stop"| R
+    CLI --> R["OpenAI response<br/>tool_calls, or text<br/>SSE via _fake_stream_chunks"]
+    H -.->|"CCAPI_AGENTIC_TEXT=1,<br/>no tools"| X["legacy _run_claude_json body<br/>--dangerously-skip-permissions<br/>full Bash/Read/Write"]
+    X --> R
     R --> C
+    K["_get_oauth_token<br/>reads ~/.claude/.credentials.json"]
 
     M["handle_models"] -.->|"hourly"| K
     K -.-> D["_refresh_models<br/>replaces VALID_MODELS on success<br/>last-good on failure"]
 
     style MW fill:#1f4d7a,color:#fff
-    style CLI fill:#7a1f1f,color:#fff
+    style X fill:#7a1f1f,color:#fff
     style K fill:#7a1f1f,color:#fff
 ```
 

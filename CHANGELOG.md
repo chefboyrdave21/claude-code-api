@@ -14,6 +14,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Every request now runs one isolated CLI turn (`_run_claude_cli`): built-in tools
+  off, no service-account settings/CLAUDE.md/hooks, caller system prompt. Tool-free
+  requests used to run Claude Code's own tool loop under
+  `--dangerously-skip-permissions`; `CCAPI_AGENTIC_TEXT=1` restores that.
+  `CLAUDE_API_LOAD_MCP` now only applies in that legacy mode.
+
+### Fixed
+- Images. The vision path called `api.anthropic.com` directly with the OAuth token
+  and was failing with `429 rate_limit_error`; images now go to the CLI as
+  stream-json image blocks, on both the plain and the tool path (where they were
+  dropped).
+
 ### Added
 - OpenAI tool calling. Requests carrying `tools` are no longer refused with
   `400 tools_not_supported`: the caller's tools are exposed to claude through a

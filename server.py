@@ -8,14 +8,17 @@ can use Claude Code's subscription-covered inference instead of a raw API key.
 Architecture:
   - aiohttp HTTP server on port 18782
   - A shared-secret middleware guards every route except GET /health. See
-    `auth_middleware` below and SECURITY.md. This endpoint spawns
-    `claude --dangerously-skip-permissions`, so an unauthenticated request body
-    is arbitrary code execution; the loopback bind must not be the only control.
+    `auth_middleware` below and SECURITY.md. Every request spawns `claude`; with
+    CCAPI_AGENTIC_TEXT=1 that is `claude --dangerously-skip-permissions`, i.e.
+    arbitrary code execution, so the loopback bind must not be the only control.
   - asyncio.Semaphore(CCAPI_MAX_CONCURRENT, default 3) caps concurrent claude
     invocations so background crons don't block interactive turns
-  - All modes: claude --print --output-format json  (reliable, no stream-json timeouts)
+  - Every request (text, images, caller tools) runs ONE isolated turn through
+    `_run_claude_cli`: stream-json in/out, no built-in tools, no service-account
+    settings/CLAUDE.md/hooks. Caller tools are bridged in via tool_bridge_mcp.py
+    and returned as tool_calls. Images go in as stream-json image blocks, so
+    nothing calls the Anthropic API with the subscription token.
   - Streaming responses: result is emitted as chunked SSE after the subprocess finishes
-    (avoids the 300s timeout caused by opus extended-thinking blocking stream-json stdout)
 
 Usage:
   python3 claude-code-api.py [--port 18782] [--debug]
@@ -59,7 +62,7 @@ QUEUE_TIMEOUT = 90     # seconds to wait for semaphore before giving up
 #
 # Why a token at all, on a loopback service: `_run_claude_json` spawns
 # `claude --print --dangerously-skip-permissions`, so a request body is arbitrary
-# code execution as the service account, and the vision and discovery paths read
+# code execution as the service account, and the discovery path reads
 # a live OAuth access token AND a durable refresh token off disk. Before this
 # existed, every local process on the box, including anything a browser or a
 # compromised dependency could reach, had that authority. A loopback bind is not
@@ -341,35 +344,10 @@ def _openai_content_to_anthropic(content) -> list:
     return blocks
 
 
-def messages_to_anthropic(messages: list) -> tuple[str, list]:
-    """
-    Convert OpenAI messages → (system_str, anthropic_messages_list).
-    Used by the SDK path (vision requests).
-    """
-    system_parts: list[str] = []
-    anthropic_msgs: list[dict] = []
-
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "system":
-            text = content if isinstance(content, str) else " ".join(
-                c.get("text", "") for c in content if isinstance(c, dict)
-            )
-            system_parts.append(text)
-        else:
-            anthropic_msgs.append({
-                "role": role,
-                "content": _openai_content_to_anthropic(content),
-            })
-
-    return "\n".join(system_parts), anthropic_msgs
-
-
 def messages_to_prompt(messages: list) -> tuple[str, str]:
     """
     Convert OpenAI-style messages list to (system_prompt, user_prompt) for claude CLI.
-    Text-only path — image blocks are silently dropped here (use SDK path for vision).
+    Legacy CCAPI_AGENTIC_TEXT path only. Image blocks are dropped here.
     """
     system_parts: list[str] = []
     turns: list[tuple[str, str]] = []
@@ -521,11 +499,29 @@ async def _claude_slot():
         if acquired:
             sem().release()
 
-async def _run_claude_json(model: str, prompt: str, system: str) -> tuple[str, dict]:
+def _agentic_text() -> bool:
+    """CCAPI_AGENTIC_TEXT=1 restores the pre-2026-10 behaviour for tool-free requests."""
+    return os.environ.get("CCAPI_AGENTIC_TEXT", "").strip().lower() in ("1", "true", "yes")
+
+
+async def _run_claude_json(model: str, prompt, system: str) -> tuple[str, dict]:
+    """Serve a request without caller tools. Returns (text, usage).
+
+    By default this is one isolated turn through `_run_claude_cli`: no built-in
+    tools, no service-account settings, CLAUDE.md or hooks, images included. A
+    chat completion should not be able to run commands, and an answer should not
+    depend on whose home directory the service runs in.
+
+    CCAPI_AGENTIC_TEXT=1 restores the old path below, where claude runs its own
+    Bash/Read/Write loop under --dangerously-skip-permissions (text only, and
+    CLAUDE_API_LOAD_MCP applies). Nothing measured on 2026-10-05 needed it.
     """
-    Run `claude --print --output-format json` and return (text_result, usage_dict).
-    Acquires the global semaphore to serialise calls.
-    """
+    if not _agentic_text():
+        text, _calls, usage = await _run_claude_cli(model, system, prompt)
+        return text, usage
+
+    if isinstance(prompt, list):
+        prompt = _text_of(prompt)
     # Pipe prompt via stdin — avoids [Errno 7] Argument list too long on large contexts.
     # System prompt is prepended inline; --append-system-prompt would also be a CLI arg.
     stdin_text = f"[System: {system}]\n\n{prompt}" if system else prompt
@@ -672,11 +668,13 @@ def _text_of(content) -> str:
     return content or ""
 
 
-def messages_to_tool_transcript(messages: list) -> tuple[str, str]:
-    """Render OpenAI messages, including tool_calls and tool results, for claude.
+def messages_to_cli_content(messages: list) -> tuple[str, list]:
+    """Render OpenAI messages into (system_prompt, user content blocks) for claude.
 
-    Returns (system_prompt, stdin_prompt). A lone user message is passed through
-    untouched. Images are dropped on this path (text only).
+    A lone user message keeps its own blocks (text and images, in order). A
+    longer conversation, including tool_calls and tool results, is rendered as
+    one text transcript; any images in it are numbered in the text and attached
+    after it as real image blocks.
     """
     system_parts: list[str] = []
     turns: list[dict] = []
@@ -688,12 +686,26 @@ def messages_to_tool_transcript(messages: list) -> tuple[str, str]:
     system = "\n\n".join(p for p in system_parts if p)
 
     if len(turns) == 1 and turns[0].get("role") == "user":
-        return system, _text_of(turns[0].get("content"))
+        return system, _openai_content_to_anthropic(turns[0].get("content") or "")
+
+    images: list[dict] = []
+
+    def body(content) -> str:
+        if not isinstance(content, list):
+            return content or ""
+        parts = []
+        for block in _openai_content_to_anthropic(content):
+            if block["type"] == "image":
+                images.append(block)
+                parts.append(f"[image {len(images)}, attached below]")
+            else:
+                parts.append(block.get("text", ""))
+        return "\n".join(parts)
 
     blocks = [TRANSCRIPT_PREAMBLE, ""]
     for msg in turns:
         role = msg.get("role")
-        text = _text_of(msg.get("content"))
+        text = body(msg.get("content"))
         if role == "user":
             blocks.append(f"<user>\n{text}\n</user>")
         elif role == "assistant":
@@ -709,7 +721,10 @@ def messages_to_tool_transcript(messages: list) -> tuple[str, str]:
             blocks.append(
                 f'<tool_result id="{msg.get("tool_call_id", "")}">\n{text}\n</tool_result>'
             )
-    return system, "\n\n".join(blocks)
+    content = [{"type": "text", "text": "\n\n".join(blocks)}]
+    for i, image in enumerate(images, 1):
+        content += [{"type": "text", "text": f"[image {i}]"}, image]
+    return system, content
 
 
 def _kill_group(proc) -> None:
@@ -723,14 +738,20 @@ def _kill_group(proc) -> None:
             proc.kill()
 
 
-async def _run_claude_tools(
-    model: str, system: str, prompt: str, tools: list, tool_choice=None,
+async def _run_claude_cli(
+    model: str, system: str, content, tools=(), tool_choice=None,
 ) -> tuple[str, list[dict], dict]:
-    """Run claude with the caller's tools bridged in.
+    """Run one isolated claude turn, with the caller's tools (if any) bridged in.
 
-    Returns (text, tool_calls, usage). tool_calls are OpenAI-shaped and carry
-    claude's own toolu_ ids, so the caller's tool_call_id round-trips cleanly.
+    `content` is a string or Anthropic user content blocks (text and images),
+    sent as a stream-json user message, which is how images reach the model
+    without calling the API directly. Returns (text, tool_calls, usage).
+    tool_calls are OpenAI-shaped and carry claude's own toolu_ ids, so the
+    caller's tool_call_id round-trips cleanly.
     """
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    stdin_line = json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n"
     names = _exposed_tool_names(tools)
     instruction = _tool_choice_instruction(tool_choice)
     if instruction:
@@ -747,10 +768,11 @@ async def _run_claude_tools(
             f.write(system or "You are a helpful assistant.")
         mcp_config = {"mcpServers": {BRIDGE_SERVER: {
             "command": sys.executable, "args": [BRIDGE_SCRIPT, tools_path],
-        }}}
+        }}} if names else {"mcpServers": {}}
         cmd = [
             "claude", "--print",
             "--model", model,
+            "--input-format", "stream-json",
             "--output-format", "stream-json", "--verbose",
             "--include-partial-messages",
             "--no-session-persistence",
@@ -758,9 +780,10 @@ async def _run_claude_tools(
             "--system-prompt-file", system_path,
             "--tools", "",
             "--strict-mcp-config", "--mcp-config", json.dumps(mcp_config),
-            "--allowedTools", ",".join(BRIDGE_PREFIX + n for n in names),
         ]
-        log.debug("Running (tools): %d tools | stdin=%d chars", len(names), len(prompt))
+        if names:
+            cmd += ["--allowedTools", ",".join(BRIDGE_PREFIX + n for n in names)]
+        log.debug("Running (cli): %d tools | stdin=%d chars", len(names), len(stdin_line))
 
         text_parts: list[str] = []
         calls: list[dict] = []
@@ -781,7 +804,7 @@ async def _run_claude_tools(
             # while we wait on stdout.
             stderr_task = asyncio.create_task(proc.stderr.read())
             try:
-                proc.stdin.write(prompt.encode())
+                proc.stdin.write(stdin_line.encode())
                 await proc.stdin.drain()
                 proc.stdin.close()
                 async with asyncio.timeout(REQUEST_TIMEOUT):
@@ -899,42 +922,6 @@ def _get_oauth_token() -> str:
     return creds["claudeAiOauth"]["accessToken"]
 
 
-async def _run_claude_sdk(model: str, system: str, anthropic_msgs: list) -> tuple[str, dict]:
-    """
-    Call the Anthropic API directly via SDK for vision / multi-modal requests.
-    Uses the OAuth access token from ~/.claude/.credentials.json (subscription-covered,
-    same token Claude Code uses — re-read on every call so expiry is handled).
-    Does NOT consume the CLI semaphore — SDK calls are async and concurrent-safe.
-    """
-    token = _get_oauth_token()
-    client = anthropic_sdk.AsyncAnthropic(auth_token=token)
-
-    kwargs: dict = {
-        "model": model,
-        "max_tokens": 4096,
-        "messages": anthropic_msgs,
-    }
-    if system:
-        kwargs["system"] = system
-
-    log.debug("SDK call: model=%s msgs=%d (vision path)", model, len(anthropic_msgs))
-
-    try:
-        response = await asyncio.wait_for(
-            client.messages.create(**kwargs),
-            timeout=REQUEST_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"Anthropic SDK call timed out after {REQUEST_TIMEOUT}s")
-
-    text = "".join(b.text for b in response.content if hasattr(b, "text"))
-    usage = {
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
-    }
-    return text, usage
-
-
 async def _fake_stream_chunks(text: str, chunk_size: int = 80) -> AsyncIterator[str]:
     """
     Break a completed response into chunks for SSE emission.
@@ -1006,12 +993,12 @@ async def _handle_tool_completion(
 ) -> web.StreamResponse:
     """Serve a request that carries `tools`, via the MCP bridge."""
     tools = body["tools"]
-    system, prompt = messages_to_tool_transcript(messages)
-    log.info("→ %s | stream=%s | model=%s | tools=%d | %d chars",
-             request.remote, streaming, model, len(tools), len(prompt))
+    system, content = messages_to_cli_content(messages)
+    log.info("→ %s | stream=%s | model=%s | tools=%d | %d msgs%s", request.remote, streaming,
+             model, len(tools), len(messages), " | images" if _has_images(messages) else "")
     try:
-        text, calls, usage = await _run_claude_tools(
-            model, system, prompt, tools, body.get("tool_choice"),
+        text, calls, usage = await _run_claude_cli(
+            model, system, content, tools, body.get("tool_choice"),
         )
     except Exception as exc:
         log.error("Tool request error: %s", exc)
@@ -1077,16 +1064,12 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     if _requests_tool_calls(body):
         return await _handle_tool_completion(request, body, model, messages, streaming)
 
-    vision = _has_images(messages)
-
-    if vision:
-        system, anthropic_msgs = messages_to_anthropic(messages)
-        log.info("→ %s | stream=%s | model=%s | vision=True | %d msgs",
-                 request.remote, streaming, model, len(anthropic_msgs))
-    else:
+    if _agentic_text():
         system, prompt = messages_to_prompt(messages)
-        log.info("→ %s | stream=%s | model=%s | %d chars",
-                 request.remote, streaming, model, len(prompt))
+    else:
+        system, prompt = messages_to_cli_content(messages)
+    log.info("→ %s | stream=%s | model=%s | %d msgs%s", request.remote, streaming, model,
+             len(messages), " | images" if _has_images(messages) else "")
 
     if streaming:
         response = web.StreamResponse(
@@ -1099,10 +1082,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         await response.prepare(request)
 
         try:
-            if vision:
-                text, usage = await _run_claude_sdk(model, system, anthropic_msgs)
-            else:
-                text, usage = await _run_claude_json(model, prompt, system)
+            text, usage = await _run_claude_json(model, prompt, system)
 
             role_chunk = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -1136,10 +1116,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 
     else:
         try:
-            if vision:
-                text, usage = await _run_claude_sdk(model, system, anthropic_msgs)
-            else:
-                text, usage = await _run_claude_json(model, prompt, system)
+            text, usage = await _run_claude_json(model, prompt, system)
         except Exception as exc:
             log.error("Non-stream error: %s", exc)
             return web.json_response(
@@ -1147,8 +1124,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                 status=500,
             )
 
-        log.info("← %s | model=%s | %d output chars | vision=%s",
-                 request.remote, model, len(text), vision)
+        log.info("← %s | model=%s | %d output chars", request.remote, model, len(text))
         resp = make_completion_response(
             model=model,
             content=text,
