@@ -236,26 +236,66 @@ maintainer's live deployment, including where it currently differs from this fil
 ## Using it from a client
 
 Any OpenAI-compatible client works. The maintainer's setup consumes it from
-**Hermes**, configured in `~/.hermes/config.yaml` as a provider:
+**Hermes** (Lumina's Telegram runtime) through **skgateway** (`:18780`), whose
+`anthropic` backend fronts this service. Hermes never talks to `:18782` directly, and
+never to `api.anthropic.com`: direct calls with the subscription token are billed as
+third-party usage and fail.
+
+`~/.hermes/config.yaml` is not under version control, so this is its source of truth
+for the parts that touch this service (state as of 2026-10-05):
 
 ```yaml
-  - name: claude-code
-    base_url: http://127.0.0.1:18782/v1
-    api_key: ${CCAPI_TOKEN}      # was '' while the endpoint checked nothing
+model:
+  default: claude-opus-5
+  provider: custom:skgateway
+  context_length: 500000
+
+agent:
+  # Send images to the main model as image parts. In `auto`, an explicit
+  # auxiliary.vision backend (sk-vision here) always wins, so images were
+  # described by sk-vision and the main model only ever saw text.
+  image_input_mode: native
+
+custom_providers:
+  - name: skgateway
+    base_url: http://127.0.0.1:18780/v1
     api_mode: chat_completions
+    # (model list elided)
+
+# Required TOGETHER with image_input_mode: native. Without it run_agent decides the
+# model is not vision-capable, strips the image parts and falls back to sk-vision.
+# Per-model on purpose: a main model not listed here keeps the describe-then-text
+# fallback instead of being sent images it cannot read.
+providers:
+  custom:skgateway:
     models:
-      - claude-opus-5
-      - claude-sonnet-5
-      - claude-fable-5
+      claude-opus-5: {supports_vision: true}
+      claude-opus-5-5: {supports_vision: true}
+      claude-sonnet-5: {supports_vision: true}
+      claude-sonnet-5-5: {supports_vision: true}
+      claude-fable-5: {supports_vision: true}
+      claude-fable-5-1: {supports_vision: true}
 ```
 
-with `CCAPI_TOKEN=<the same secret>` in `~/.hermes/.env`. Hermes hands `api_key` to
-the OpenAI SDK, which sends it as `Authorization: Bearer`, which is exactly what this
-server accepts. That is the whole client-side change.
+The `CCAPI_TOKEN` is held by skgateway's `anthropic` backend, not by Hermes.
 
-**Do not** configure this as a global custom header (Hermes `model.default_headers`).
-That would attach the secret to every OpenAI-compatible provider Hermes talks to, some
-of which are off-box. `api_key` is scoped to the one provider.
+Things that broke before and how to spot them:
+
+- **Every Telegram turn fails with "model provider failed after retries".** From
+  2026-09-17 to 2026-10-04 this service refused any request carrying `tools` with
+  `400 tools_not_supported`, and Hermes sends tools on every turn. Fixed by the MCP
+  bridge (#7). If it recurs, `~/.hermes/logs/errors.log` names the 400.
+- **Images described instead of seen.** Check for `| images` on the `→` line in
+  `journalctl --user -u claude-code-api`. If it is missing and
+  `tools.vision_tools: Analyzing image` appears in `~/.hermes/logs/agent.log`, one of
+  the two settings above is missing.
+- **Switching models with `/model`** saves to `config.yaml` (`--global`). Any claude-*
+  model works through this service now; a model missing from the `providers` block
+  gets images through sk-vision.
+
+To confirm end to end: `hermes chat -q "Run 'date' with your terminal tool"` should
+show a tool call in the session, and `hermes chat --image <png> -q "what color?"`
+should log `| images` here.
 
 ## Known limitations
 
