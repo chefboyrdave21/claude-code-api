@@ -98,6 +98,7 @@ python3 server.py --debug         # verbose logging
 | `CCAPI_MAX_CONCURRENT` | env | `3` | Concurrent `claude` subprocesses. |
 | `CCAPI_AGENTIC_TEXT` | env | unset (off) | `1` makes tool-free requests run Claude Code's own Bash/Read/Write loop under `--dangerously-skip-permissions` again. This is a security setting. |
 | `CLAUDE_API_LOAD_MCP` | env | unset (off) | Only with `CCAPI_AGENTIC_TEXT=1`: boots the host's MCP servers inside every subprocess. Roughly doubles per-request latency and widens the blast radius. This is a security setting. |
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | env (read by the `claude` CLI, inherited by every child) | CLI default | Output ceiling per turn. This service ignores a request's `max_tokens`, so this is the only output cap on the path. The maintainer sets `128000` (accepted by claude-opus-5, 2026-10-06). |
 | `REQUEST_TIMEOUT` | constant, `server.py` | `1800` s | Per-call ceiling. Not an env var. |
 | `QUEUE_TIMEOUT` | constant, `server.py` | `90` s | How long a request waits for a semaphore slot before giving up. |
 | `DEFAULT_MODEL` | constant, `server.py` | `claude-opus-5` | Used for an unrecognised model name. |
