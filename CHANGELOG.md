@@ -15,6 +15,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Docs
+- README settings: `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, the only output cap on the path
+  (request `max_tokens` is ignored).
+
+### Docs
 - README: the Hermes integration section described a direct `claude-code` provider
   that is no longer how it is wired. It now records the real setup (Hermes ->
   skgateway -> this service), the two Hermes settings native images need, and how
