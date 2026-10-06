@@ -16,7 +16,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Docs
 - README settings: `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, the only output cap on the path
-  (request `max_tokens` is ignored).
+  (request `max_tokens` is ignored). The CLI clamps it to the model maximum,
+  128000 for every Claude 5.x model.
 
 ### Docs
 - README: the Hermes integration section described a direct `claude-code` provider
