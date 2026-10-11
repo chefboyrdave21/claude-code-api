@@ -555,8 +555,26 @@ async def _run_claude_json(model: str, prompt, system: str) -> tuple[str, dict]:
                 proc.communicate(input=stdin_text.encode()), timeout=REQUEST_TIMEOUT
             )
         except asyncio.TimeoutError:
-            proc.kill()
-            raise RuntimeError(f"claude timed out after {REQUEST_TIMEOUT}s")
+            raise RuntimeError(f"claude timed out after {REQUEST_TIMEOUT}s") from None
+        finally:
+            # HARDENING, not a proven fix. On 2026-10-11 ten <defunct> children
+            # of this server, aged up to four days, held every concurrency slot
+            # and claude-* routes returned "no free claude slot within 90s".
+            # A restart cleared it. The mechanism that defeated asyncio's child
+            # watcher was NOT reproduced: under test both a REQUEST_TIMEOUT
+            # expiry and a cancelled request reap correctly without this block.
+            #
+            # What was plainly wrong regardless: `proc.kill()` signals claude
+            # alone, while claude shares a process group with the bridge it
+            # spawns (that is why the streaming path has always used
+            # _kill_group), and it only ran inside `except asyncio.TimeoutError`,
+            # so a cancelled request -- what a disconnecting client produces,
+            # and skgateway disconnects at 90s while REQUEST_TIMEOUT is 1800 --
+            # signalled nothing at all. Tear the group down on every exit path,
+            # as the streaming path does. Both calls no-op once communicate()
+            # has reaped normally.
+            _kill_group(proc)
+            await proc.wait()
 
     if proc.returncode != 0:
         err = stderr.decode(errors="replace")[:500]
