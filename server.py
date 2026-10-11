@@ -504,6 +504,32 @@ def _agentic_text() -> bool:
     return os.environ.get("CCAPI_AGENTIC_TEXT", "").strip().lower() in ("1", "true", "yes")
 
 
+def prompt_tokens_of(usage: dict) -> int:
+    """Total input tokens for a claude call, cache included.
+
+    `claude --print` leans on prompt caching, so the bulk of a real prompt is
+    reported under cache_creation_input_tokens / cache_read_input_tokens and
+    bare `input_tokens` stays tiny. A 13.5k-char prompt measured on 2026-10-11:
+
+        cache_creation_input_tokens: 37795
+        cache_read_input_tokens:     10468
+        input_tokens:                    2
+        -> 48265 total, or 2 if you read input_tokens alone
+
+    The tool/streaming path summed all three; the plain non-stream path read
+    only input_tokens and therefore reported prompt_tokens=2 for every request
+    regardless of size, including a verified 181,816-byte, 183-message
+    conversation. Clients that size their context window off usage (Hermes
+    decides when to compress) were being handed a number ~24000x too small.
+    One helper so the two paths cannot drift apart again.
+    """
+    return (
+        usage.get("input_tokens", 0)
+        + usage.get("cache_read_input_tokens", 0)
+        + usage.get("cache_creation_input_tokens", 0)
+    )
+
+
 async def _run_claude_json(model: str, prompt, system: str) -> tuple[str, dict]:
     """Serve a request without caller tools. Returns (text, usage).
 
@@ -1025,8 +1051,7 @@ async def _handle_tool_completion(
     log.info("← %s | model=%s | %d tool calls%s | %d output chars", request.remote, model,
              len(calls), f" ({', '.join(c['function']['name'] for c in calls)})" if calls else "",
              len(text))
-    prompt_tokens = (usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
-                     + usage.get("cache_creation_input_tokens", 0))
+    prompt_tokens = prompt_tokens_of(usage)
     completion_tokens = usage.get("output_tokens", 0)
 
     if not streaming:
@@ -1146,7 +1171,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         resp = make_completion_response(
             model=model,
             content=text,
-            prompt_tokens=usage.get("input_tokens", 0),
+            prompt_tokens=prompt_tokens_of(usage),
             completion_tokens=usage.get("output_tokens", 0),
         )
         return web.json_response(resp)
