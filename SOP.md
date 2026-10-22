@@ -435,7 +435,7 @@ checks:
   - name: SECURITY.md permission-bypass claim still matches the spawned argv
     run: grep -qE '^\s*"--dangerously-skip-permissions",$' server.py
   - name: documented concurrency default matches the semaphore
-    run: grep -qE '^\s*n = max\(1, int\(os\.environ\.get\("CCAPI_MAX_CONCURRENT", "3"\)\)\)$' server.py
+    run: grep -qE '^\s*return max\(1, int\(os\.environ\.get\("CCAPI_MAX_CONCURRENT", "3"\)\)\)$' server.py
   - name: documented loopback-only default bind matches the arg parser
     run: grep -qE '^\s*parser\.add_argument\("--host", default="127\.0\.0\.1"' server.py
   - name: documented request timeout matches the constant
