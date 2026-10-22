@@ -12,6 +12,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -67,6 +68,7 @@ class PoisonedWatcherTests(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    @unittest.skipIf(sys.version_info < (3, 12), "PidfdChildWatcher is the default from 3.12")
     async def test_mechanism_proc_wait_hangs_and_child_stays_a_zombie(self):
         """The bug itself, so a future asyncio that fixes it shows up here."""
         proc = await asyncio.create_subprocess_exec("true")
