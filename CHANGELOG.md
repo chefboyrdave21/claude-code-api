@@ -14,6 +14,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Recurring "no free claude slot within 90s" outages (2026-10-11, 2026-10-21):
+  claude children whose exit asyncio never noticed stayed `<defunct>` and held
+  their concurrency slot until a restart. Root cause: Python 3.12's
+  PidfdChildWatcher polls each child's pidfd through the event loop's selector,
+  and a stale selector entry on a reused fd number swallows the pidfd
+  (`selectors.modify` skips `epoll_ctl` when the mask is unchanged), so
+  `proc.wait()` never returns. Both spawn paths now reap through `_reap()`
+  (asyncio for 5s, then a blocking `waitpid` in a thread), the non-stream path no
+  longer uses `communicate()` and runs in its own session, and a 60s watchdog
+  clears stale selector fds (logging the callback that leaked them) and reaps
+  zombie children. `/health` reports free slots and reaper counters.
+  `test_child_reaper.py` reproduces the hang.
+
 ### Docs
 - README settings: `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, the only output cap on the path
   (request `max_tokens` is ignored). The CLI clamps it to the model maximum,

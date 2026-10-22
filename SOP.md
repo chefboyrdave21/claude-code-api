@@ -350,6 +350,7 @@ unexpectedly strong or weak.
 | Unit flaps or restarts forever | `journalctl --user -u claude-code-api -n 100`. `Restart=always` with no `StartLimitBurst` means a bad `ExecStart` path retries forever instead of failing loudly. Verify the file exists at the effective `ExecStart` path: `systemctl --user show claude-code-api -p ExecStart`. |
 | Every request 500s with `claude exited <n>` | The CLI itself is failing. Reproduce outside the server: `claude --print --model claude-haiku-4-5 <<< hi`. Usually auth: re-authenticate the CLI. |
 | Requests hang, then fail after ~90 s | Semaphore starvation. All `CCAPI_MAX_CONCURRENT` slots are held by long calls and yours hit `QUEUE_TIMEOUT`. `journalctl` shows the concurrency at startup. Raise the drop-in value or reduce load. |
+| ~90 s failures with no traffic, `<defunct>` claude children of the server | The slot-leak signature (2026-10-11, 2026-10-21). `curl -s :18782/health` shows `slots.free` and `reaper` counters; `ps --ppid $(systemctl --user show claude-code-api -p MainPID --value)` lists zombies. Since the reaper landed this should self-heal within ~60 s and log `child watcher missed` or `watchdog reaped`/`cleared stale selector fds` with the leaking callback: capture that line before restarting. |
 | A single request pins the box for 30 min | That is `REQUEST_TIMEOUT = 1800`. Working as designed. Kill the subprocess or restart the unit. |
 | Answers come from the wrong model | `normalise_model` fell back to `DEFAULT_MODEL` for an unrecognised name. `journalctl --user -u claude-code-api \| grep "Unknown model"`. |
 | `/health` reports port 18782 but you started it elsewhere | Known wart: the handler returns the module constant. Trust `ss -tlnp`. |
@@ -434,7 +435,7 @@ checks:
   - name: SECURITY.md permission-bypass claim still matches the spawned argv
     run: grep -qE '^\s*"--dangerously-skip-permissions",$' server.py
   - name: documented concurrency default matches the semaphore
-    run: grep -qE '^\s*n = max\(1, int\(os\.environ\.get\("CCAPI_MAX_CONCURRENT", "3"\)\)\)$' server.py
+    run: grep -qE '^\s*return max\(1, int\(os\.environ\.get\("CCAPI_MAX_CONCURRENT", "3"\)\)\)$' server.py
   - name: documented loopback-only default bind matches the arg parser
     run: grep -qE '^\s*parser\.add_argument\("--host", default="127\.0\.0\.1"' server.py
   - name: documented request timeout matches the constant

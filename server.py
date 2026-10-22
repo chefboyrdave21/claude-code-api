@@ -169,10 +169,14 @@ _discovery_ok: bool = False
 _discovery_error: str | None = None
 
 
+def _sem_limit() -> int:
+    return max(1, int(os.environ.get("CCAPI_MAX_CONCURRENT", "3")))
+
+
 def sem() -> asyncio.Semaphore:
     global _sem
     if _sem is None:
-        n = max(1, int(os.environ.get("CCAPI_MAX_CONCURRENT", "3")))
+        n = _sem_limit()
         _sem = asyncio.Semaphore(n)
         log.info("claude subprocess concurrency: %d", n)
     return _sem
@@ -569,42 +573,37 @@ async def _run_claude_json(model: str, prompt, system: str) -> tuple[str, dict]:
     log.debug("Running (non-stream): %s | stdin=%d chars", " ".join(cmd[:6]) + " ...", len(stdin_text))
 
     async with _claude_slot():
+        # Own session so _kill_group reaches the Bash children an agentic claude
+        # spawns; without it killpg() found no group and fell back to claude alone.
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_child_env(),
+            start_new_session=True,
         )
+        returncode = None
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=stdin_text.encode()), timeout=REQUEST_TIMEOUT
-            )
-        except asyncio.TimeoutError:
+            # Not proc.communicate(): it ends in proc.wait(), which trusts the
+            # child watcher, and when the watcher misses the exit (see _reap) it
+            # held the slot for the full REQUEST_TIMEOUT before even reaching
+            # the reap below. Reading to EOF does not depend on the watcher.
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                stdout, stderr = await _drain(proc, stdin_text.encode())
+        except TimeoutError:
             raise RuntimeError(f"claude timed out after {REQUEST_TIMEOUT}s") from None
         finally:
-            # HARDENING, not a proven fix. On 2026-10-11 ten <defunct> children
-            # of this server, aged up to four days, held every concurrency slot
-            # and claude-* routes returned "no free claude slot within 90s".
-            # A restart cleared it. The mechanism that defeated asyncio's child
-            # watcher was NOT reproduced: under test both a REQUEST_TIMEOUT
-            # expiry and a cancelled request reap correctly without this block.
-            #
-            # What was plainly wrong regardless: `proc.kill()` signals claude
-            # alone, while claude shares a process group with the bridge it
-            # spawns (that is why the streaming path has always used
-            # _kill_group), and it only ran inside `except asyncio.TimeoutError`,
-            # so a cancelled request -- what a disconnecting client produces,
-            # and skgateway disconnects at 90s while REQUEST_TIMEOUT is 1800 --
-            # signalled nothing at all. Tear the group down on every exit path,
-            # as the streaming path does. Both calls no-op once communicate()
-            # has reaped normally.
+            # Tear the group down on every exit path (a cancelled request, which
+            # is what a disconnecting client produces, used to signal nothing),
+            # then reap without trusting asyncio alone. Both are no-ops once
+            # claude has exited and been reaped normally.
             _kill_group(proc)
-            await proc.wait()
+            returncode = await _reap(proc)
 
-    if proc.returncode != 0:
+    if returncode != 0:
         err = stderr.decode(errors="replace")[:500]
-        raise RuntimeError(f"claude exited {proc.returncode}: {err}")
+        raise RuntimeError(f"claude exited {returncode}: {err}")
 
     raw = stdout.decode(errors="replace").strip()
     try:
@@ -782,6 +781,155 @@ def _kill_group(proc) -> None:
             proc.kill()
 
 
+# ─── Reaping without trusting the child watcher ──────────────────────────────
+#
+# ROOT CAUSE of the recurring "no free claude slot within 90s" outages
+# (2026-10-11, 2026-10-21; ten <defunct> claude children holding all ten slots,
+# fixed only by a restart). On Linux, Python 3.12 picks PidfdChildWatcher: each
+# child's pidfd is registered as a reader on the event loop's selector, and the
+# exit is noticed when that pidfd turns readable. If anything leaves a stale
+# selector registration behind (an fd closed without remove_reader), the next
+# pidfd that reuses the number is "registered" by selectors.modify(), which skips
+# epoll_ctl when the event mask is unchanged. The pidfd never reaches epoll, the
+# exit is never seen, the child stays a zombie, and `await proc.wait()` never
+# returns, with the concurrency slot held. Reproduced in test_child_reaper.py.
+#
+# So: wait on asyncio for a short grace, then reap the pid ourselves from a
+# thread (blocking waitpid needs no selector), and run a watchdog that clears
+# stale registrations before they are reused and reaps any zombie child that
+# escaped both. Every rescue is logged with what leaked, and counted on /health.
+
+REAP_GRACE = 5               # seconds asyncio gets to notice a killed child
+REAP_FALLBACK_TIMEOUT = 30   # a SIGKILLed child that has not exited by now is stuck in D state
+WATCHDOG_INTERVAL = 60
+_reaper_stats = {"watcher_missed": 0, "zombies_reaped": 0, "stale_fds_cleared": 0}
+
+
+def _waitpid_blocking(pid: int) -> int | None:
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        return None  # already reaped, normally by asyncio winning the race
+    return os.waitstatus_to_exitcode(status)
+
+
+async def _reap(proc) -> int | None:
+    """Wait for claude to exit and return its exit code, or None if unknowable.
+
+    Never blocks indefinitely: the caller is holding a concurrency slot.
+    """
+    if proc.returncode is not None:
+        return proc.returncode
+    try:
+        return await asyncio.wait_for(proc.wait(), REAP_GRACE)
+    except TimeoutError:
+        pass
+    _reaper_stats["watcher_missed"] += 1
+    log.error(
+        "child watcher missed claude pid %d; reaping it directly. stale selector fds: %s",
+        proc.pid, _clear_stale_selector_fds() or "none found",
+    )
+    try:
+        rc = await asyncio.wait_for(asyncio.to_thread(_waitpid_blocking, proc.pid), REAP_FALLBACK_TIMEOUT)
+    except TimeoutError:
+        log.error("claude pid %d still not exited %ds after SIGKILL; releasing its slot anyway",
+                  proc.pid, REAP_FALLBACK_TIMEOUT)
+        return None
+    if rc is None:
+        return proc.returncode
+    # Tell the transport, as the watcher would have, so it closes cleanly and
+    # never later polls (or kills) a pid number that may have been reused.
+    transport = getattr(proc, "_transport", None)
+    if transport is not None and getattr(transport, "_returncode", 0) is None:
+        transport._process_exited(rc)
+    return rc
+
+
+async def _drain(proc, data: bytes) -> tuple[bytes, bytes]:
+    """Feed stdin and read stdout/stderr to EOF. communicate() minus its wait()."""
+    async def feed():
+        try:
+            proc.stdin.write(data)
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # claude exited early; its stderr says why
+        finally:
+            proc.stdin.close()
+
+    _, out, err = await asyncio.gather(feed(), proc.stdout.read(), proc.stderr.read())
+    return out, err
+
+
+def _clear_stale_selector_fds() -> list[str]:
+    """Unregister selector entries whose fd is closed; return what leaked them.
+
+    Only catches a stale entry before its number is reused (after reuse it
+    looks like a live fd). The handle repr names the callback that registered
+    it, which is the lead for whoever finally finds the leaker.
+    """
+    loop = asyncio.get_running_loop()
+    selector = getattr(loop, "_selector", None)
+    if selector is None:
+        return []
+    found = []
+    for fd, key in list(selector.get_map().items()):
+        try:
+            os.fstat(fd)
+            continue
+        except OSError:
+            pass
+        reader, writer = key.data if isinstance(key.data, tuple) else (key.data, None)
+        found.append(f"fd {fd}: reader={reader!r} writer={writer!r}")
+        loop._remove_reader(fd)
+        loop._remove_writer(fd)
+        _reaper_stats["stale_fds_cleared"] += 1
+    return found
+
+
+def _zombie_children() -> list[int]:
+    me = os.getpid()
+    zombies = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # comm (field 2) may contain spaces and parens; split after its ")".
+        fields = stat[stat.rfind(")") + 2:].split()
+        if fields[0] == "Z" and int(fields[1]) == me:
+            zombies.append(int(entry))
+    return zombies
+
+
+async def _watchdog_loop() -> None:
+    """Every WATCHDOG_INTERVAL: clear stale selector fds, reap long-dead children.
+
+    A child must be a zombie on two consecutive passes before it is reaped here,
+    so a normal exit asyncio is about to collect is never stolen.
+    """
+    seen: set[int] = set()
+    while True:
+        try:
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+            stale = _clear_stale_selector_fds()
+            if stale:
+                log.error("watchdog cleared stale selector fds: %s", stale)
+            zombies = set(_zombie_children())
+            for pid in zombies & seen:
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(pid, os.WNOHANG)
+                    _reaper_stats["zombies_reaped"] += 1
+                    log.error("watchdog reaped zombie child pid %d that asyncio never collected", pid)
+            seen = zombies - seen
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("watchdog iteration failed, continuing: %s", exc)
+
+
 async def _run_claude_cli(
     model: str, system: str, content, tools=(), tool_choice=None,
 ) -> tuple[str, list[dict], dict]:
@@ -896,13 +1044,13 @@ async def _run_claude_cli(
                 raise RuntimeError(f"claude timed out after {REQUEST_TIMEOUT}s") from None
             finally:
                 _kill_group(proc)
-                await proc.wait()
+                returncode = await _reap(proc)
                 if calls or result_text is not None:
                     stderr_task.cancel()
 
         if not calls and result_text is None:
             err = (await stderr_task).decode(errors="replace")[:500]
-            raise RuntimeError(f"claude exited {proc.returncode} without a result: {err}")
+            raise RuntimeError(f"claude exited {returncode} without a result: {err}")
 
     text = result_text if (result_text is not None and not calls) else "\n\n".join(text_parts)
     return text, calls, usage
@@ -1013,6 +1161,11 @@ async def handle_health(request: web.Request) -> web.Response:
             "models_served": len(VALID_MODELS),
             "last_error": _discovery_error[:HEALTH_ERROR_MAX_CHARS] if _discovery_error else None,
         },
+        # free == 0 for long stretches with no traffic is the slot-leak signature;
+        # nonzero reaper counts mean the watcher missed exits and _reap/the
+        # watchdog covered for it (the journal has the details).
+        "slots": {"limit": _sem_limit(), "free": sem()._value},
+        "reaper": dict(_reaper_stats),
     })
 
 
@@ -1212,12 +1365,14 @@ async def _refresh_loop() -> None:
 async def _on_startup(app: web.Application) -> None:
     asyncio.create_task(_refresh_models())
     app["refresh_loop"] = asyncio.create_task(_refresh_loop())
+    app["watchdog"] = asyncio.create_task(_watchdog_loop())
 
 
 async def _on_cleanup(app: web.Application) -> None:
-    task = app.get("refresh_loop")
-    if task is not None:
-        task.cancel()
+    for name in ("refresh_loop", "watchdog"):
+        task = app.get(name)
+        if task is not None:
+            task.cancel()
 
 
 def build_app() -> web.Application:
